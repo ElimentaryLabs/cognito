@@ -26,6 +26,7 @@ console.log(`🔨 Building Cognito AI Extension (${mode} mode)...\n`);
 const filesToCopy = [
   'manifest.json',
   'popup.html',
+  'options.html',
   'styles.css',
   'html2canvas.min.js',
   'icons/',
@@ -37,6 +38,7 @@ const jsFiles = [
   'background.js',
   'content.js',
   'popup.js',
+  'options.js',
   'integrations.js',
   'database.js'
 ];

@@ -28,6 +28,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     
     // Export data button
     document.getElementById('export-data').addEventListener('click', exportComments);
+
+    // Settings button - profile, database, Jira and AI configuration all live on the
+    // extension's own options page rather than in the injected sidebar.
+    document.getElementById('open-settings').addEventListener('click', () => {
+      chrome.runtime.openOptionsPage();
+      window.close();
+    });
   });
   
   async function loadStats() {

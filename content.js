@@ -4,9 +4,21 @@ class Stickr {
       this.isAddingComment = false;
       this.comments = [];
     this.platform = this.detectPlatform();
-      this.genericTargetAttribute = 'data-stickr-target-id';
+      // Session-only map of a stored comment's targetId -> the live element it anchors
+      // to. Decision: hold this in memory rather than stamping a data attribute onto the
+      // site's own elements. The attribute's value came from the synced comment record,
+      // so re-applying it on every visit handed each site a stable identifier for this
+      // user across sessions and devices (rejected: hashing the value — the attribute's
+      // presence alone still discloses that this user has a note on that element).
+      this.genericTargets = new Map();
       this.currentPageId = this.generatePageId();
       this.sidebar = null;
+      this.uiHost = null;  // page-level host element that owns the closed shadow root
+      this.uiRoot = null;  // the closed ShadowRoot; the only place our UI is mounted
+      this.uiLayer = null; // styling and stacking wrapper inside the shadow root
+      this.commentHandles = new Map();     // render handle -> comment id
+      this.commentHandlesById = new Map(); // comment id -> render handle
+      this.nextCommentHandle = 0;
     this.bubbleMap = new Map(); // Map: chartHash -> {bubble, chartElement, comments}
     this.resizeObserver = null;
     this.mutationObserver = null;
@@ -74,6 +86,168 @@ class Stickr {
       // Disable all interactive features
       this.extensionContextValid = false;
     }
+
+    // === Extension UI isolation ==============================================
+    // Every node this extension renders lives inside a closed shadow root, so the host
+    // page can neither read it nor drive it. Before this, the sidebar, dialogs and
+    // bubble pins were plain children of document.body: any site could read the synced
+    // notes and their record ids straight out of them, and could write a value into the
+    // quick-note field and fire a synthetic click on Add to make the extension store
+    // (and sync) an identifier of the site's choosing.
+    // Decision: closed shadow root, because `mode: 'closed'` withholds the ShadowRoot
+    // reference from page script (rejected: an open root — `host.shadowRoot` hands the
+    // same access straight back; rejected: renaming or randomising the element ids —
+    // the nodes stay findable by tag/class/shape).
+    ensureUiRoot() {
+      if (this.uiLayer && this.uiLayer.isConnected) {
+        return this.uiLayer;
+      }
+
+      // The 'stickr-' prefix is load-bearing: isInternalElement() uses it to keep this
+      // host out of chart/annotation-target detection.
+      const host = document.createElement('div');
+      host.id = 'stickr-ui-root';
+
+      // Layout-neutral, and immune to page CSS because an inline !important declaration
+      // outranks any author rule the site can write. Absolutely positioned at the
+      // document origin so bubble pins keep resolving against the same containing block
+      // they used as children of document.body; deliberately no transform, filter,
+      // perspective or will-change here, since any of those would turn this into the
+      // containing block for position: fixed and break the sidebar and dialogs.
+      const hostStyle = {
+        position: 'absolute',
+        top: '0',
+        left: '0',
+        width: '0',
+        height: '0',
+        margin: '0',
+        padding: '0',
+        border: '0',
+        'z-index': '2147483647'
+      };
+      Object.keys(hostStyle).forEach(prop => {
+        host.style.setProperty(prop, hostStyle[prop], 'important');
+      });
+
+      const root = host.attachShadow({ mode: 'closed' });
+
+      const layer = document.createElement('div');
+      layer.className = 'dc-ui-layer';
+      // Hidden until the stylesheet resolves, otherwise the sidebar flashes unstyled.
+      layer.style.visibility = 'hidden';
+      const reveal = () => { layer.style.visibility = ''; };
+
+      // styles.css is attached here instead of through manifest content_scripts.css,
+      // which applied it to the host page and let its :root variables and bare
+      // input/select rules restyle the site itself.
+      // chrome.runtime.getURL throws once the extension context has been torn down, and
+      // handleExtensionContextInvalidation() still needs to raise a toast at that point,
+      // so an unstyled root is better than no root at all.
+      try {
+        const link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = chrome.runtime.getURL('styles.css');
+        link.addEventListener('load', reveal);
+        // A subresource load can still be refused (a strict page CSP, a stray blocker).
+        // Fall back to a constructed stylesheet, which the content script fetches with
+        // its own privileges and hands to the shadow root directly.
+        link.addEventListener('error', () => {
+          this.adoptFallbackStyles(root).then(reveal, reveal);
+        });
+        root.appendChild(link);
+      } catch (error) {
+        console.warn('Cognito styles unavailable:', error.message);
+        reveal();
+      }
+
+      root.appendChild(layer);
+      (document.body || document.documentElement).appendChild(host);
+
+      this.uiHost = host;
+      this.uiRoot = root;
+      this.uiLayer = layer;
+
+      return layer;
+    }
+
+    // Last-resort styling path for ensureUiRoot(): read our own stylesheet and adopt it
+    // as a constructed sheet. @import rules are dropped by replaceSync, so the webfont
+    // in styles.css is lost and the UI falls back to the local sans-serif stack.
+    async adoptFallbackStyles(root) {
+      try {
+        const response = await fetch(chrome.runtime.getURL('styles.css'));
+        const sheet = new CSSStyleSheet();
+        sheet.replaceSync(await response.text());
+        root.adoptedStyleSheets = [sheet];
+      } catch (error) {
+        console.warn('Failed to load Cognito styles:', error);
+      }
+    }
+
+    // Mount an extension-owned node inside the shadow root.
+    uiAppend(node) {
+      return this.ensureUiRoot().appendChild(node);
+    }
+
+    // Scoped stand-ins for document.getElementById / querySelector: the extension's own
+    // UI is no longer part of the page document, so document-level lookups miss it.
+    uiById(id) {
+      this.ensureUiRoot();
+      return this.uiRoot.getElementById(id);
+    }
+
+    uiQuery(selector) {
+      this.ensureUiRoot();
+      return this.uiRoot.querySelector(selector);
+    }
+
+    uiQueryAll(selector) {
+      this.ensureUiRoot();
+      return this.uiRoot.querySelectorAll(selector);
+    }
+
+    // An event raised inside a shadow tree is retargeted to the host before it reaches
+    // document level, so e.target.closest('.dc-...') can no longer see our own nodes.
+    // Walk the composed path instead.
+    uiElementFromEvent(e, selector) {
+      const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+      return path.find(node => node.nodeType === 1 && node.matches && node.matches(selector)) || null;
+    }
+
+    // === Non-persistent comment handles ======================================
+    // comment.id is persisted and synced, so it identifies a user across sessions and
+    // devices; emitting it into markup published a ready-made tracking identifier.
+    // Handles are minted per page load and carry no meaning outside it.
+    commentHandle(id) {
+      let handle = this.commentHandlesById.get(id);
+      if (!handle) {
+        handle = `h${++this.nextCommentHandle}`;
+        this.commentHandlesById.set(id, handle);
+        this.commentHandles.set(handle, id);
+      }
+      return handle;
+    }
+
+    commentIdFromHandle(handle) {
+      return handle ? (this.commentHandles.get(handle) || null) : null;
+    }
+
+    // Open the extension's own settings page. Credentials (AI key, Jira token, database
+    // connection) and the user's email are entered there, on the chrome-extension://
+    // origin, rather than in dialogs injected into whatever site is open.
+    openSettings() {
+      if (!this.isExtensionContextValid()) {
+        console.warn('Extension context invalidated, cannot open settings');
+        return;
+      }
+
+      chrome.runtime.sendMessage({ action: 'openOptions' }, () => {
+        if (chrome.runtime.lastError) {
+          console.warn('Failed to open settings:', chrome.runtime.lastError.message);
+        }
+      });
+    }
+
   
     // Detect which platform we're on
     detectPlatform() {
@@ -247,7 +421,7 @@ class Stickr {
         console.log('📅 Initial filter state:', this.currentFilterState);
       }
       
-      this.injectSidebar();
+      await this.injectSidebar();
       this.loadComments();
       this.setupEventListeners();
       this.observeDOMChanges();
@@ -268,8 +442,10 @@ class Stickr {
       const result = await this.safeChromeStorage(() => chrome.storage.sync.get(['userEmail', 'userRole']));
       
       if (!result || !result.userEmail) {
-        // Show email registration dialog
-        await this.showEmailDialog();
+        // Registration happens on the settings page now; notes stay attributed to
+        // 'Anonymous' until the user fills it in. Asking here put their email address
+        // into an input that shared the DOM of whatever site they happened to be on.
+        this.showToast('⚙️ Open Cognito settings to add your name and role', 'info', 6000);
       } else {
         this.userEmail = result.userEmail;
         this.userRole = result.userRole || '';
@@ -278,1681 +454,24 @@ class Stickr {
       }
     }
     
-    // Show email registration dialog
-    showEmailDialog() {
-      return new Promise((resolve) => {
-        const dialog = document.createElement('div');
-        dialog.className = 'dc-dialog-overlay';
-        dialog.style.zIndex = '10000000';
-        
-        dialog.innerHTML = `
-          <div class="dc-dialog" style="max-width: 600px;">
-            <div class="dc-dialog-header" style="display: flex; justify-content: center; align-items: center; position: relative; border-bottom: none; padding-bottom: 0.5rem;">
-              <h3 style="font-size: 24px; font-weight: 700; color: #1F2937; text-align: center; margin: 0;">Cognito AI - Intelligence made Elementary</h3>
-              <button class="dc-dialog-close" id="dc-email-close" style="position: absolute; right: 20px; top: 50%; transform: translateY(-50%);">×</button>
-            </div>
-            <div class="dc-dialog-body">
-              <p style="margin-bottom: 1.5rem; font-size: 16px; font-weight: 500; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;">
-                ⚡ Supercharge Your Dashboards with AI-Powered Insights
-              </p>
-              <div style="margin-bottom: 1rem;">
-                <label for="dc-email-input" style="display: block; margin-bottom: 0.5rem; font-size: 14px; font-weight: 500; color: #374151;">Email Address</label>
-                <input 
-                  type="email" 
-                  id="dc-email-input" 
-                  class="dc-comment-input" 
-                  placeholder="your.email@company.com"
-                  style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; min-height: auto; height: auto; box-sizing: border-box;"
-                >
-              </div>
-              <div style="margin-bottom: 1rem;">
-                <label for="dc-role-input" style="display: block; margin-bottom: 0.5rem; font-size: 14px; font-weight: 500; color: #374151;">Your Role</label>
-                <select 
-                  id="dc-role-input" 
-                  style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; min-height: auto; height: auto; box-sizing: border-box; background: white; cursor: pointer;"
-                >
-                  <option value="">Select your role...</option>
-                  <option value="Data Analyst">Data Analyst</option>
-                  <option value="Business Analyst">Business Analyst</option>
-                  <option value="Data Scientist">Data Scientist</option>
-                  <option value="Product Manager">Product Manager</option>
-                  <option value="Engineering Manager">Engineering Manager</option>
-                  <option value="Executive">Executive</option>
-                  <option value="Operations Manager">Operations Manager</option>
-                  <option value="Marketing Manager">Marketing Manager</option>
-                  <option value="Sales Manager">Sales Manager</option>
-                  <option value="Finance Manager">Finance Manager</option>
-                  <option value="Developer">Developer</option>
-                  <option value="Other">Other</option>
-                </select>
-                <input 
-                  type="text" 
-                  id="dc-role-custom" 
-                  placeholder="Specify your role"
-                  style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; margin-top: 0.5rem; min-height: auto; height: auto; box-sizing: border-box; display: none;"
-                >
-              </div>
-              <p id="dc-email-error" style="color: #EF4444; font-size: 12px; margin-top: 0.5rem; display: none;"></p>
-            </div>
-            <div class="dc-dialog-footer" style="padding-top: 1rem;">
-              <button class="dc-btn dc-btn-primary" id="dc-email-submit" style="width: 100%; padding: 0.65rem 1.5rem; font-size: 15px;">
-                Get Started
-              </button>
-            </div>
-          </div>
-        `;
-        
-        document.body.appendChild(dialog);
-        
-        const emailInput = document.getElementById('dc-email-input');
-        const roleSelect = document.getElementById('dc-role-input');
-        const roleCustomInput = document.getElementById('dc-role-custom');
-        const errorMsg = document.getElementById('dc-email-error');
-        const submitBtn = document.getElementById('dc-email-submit');
-        const closeBtn = document.getElementById('dc-email-close');
-        
-        // Show custom role input when "Other" is selected
-        roleSelect.addEventListener('change', () => {
-          if (roleSelect.value === 'Other') {
-            roleCustomInput.style.display = 'block';
-            roleCustomInput.focus();
-          } else {
-            roleCustomInput.style.display = 'none';
-            roleCustomInput.value = '';
-          }
-        });
-        
-        // Close button handler
-        closeBtn.addEventListener('click', () => {
-          dialog.remove();
-          // Don't resolve or reject - just exit the flow completely
-        });
-        
-        emailInput.focus();
-        
-        const validateAndSubmit = async () => {
-          const email = emailInput.value.trim();
-          const role = roleSelect.value === 'Other' 
-            ? roleCustomInput.value.trim() 
-            : roleSelect.value;
-          
-          // Email validation
-          const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-          
-          if (!email || !emailRegex.test(email)) {
-            errorMsg.textContent = 'Please enter a valid email address';
-            errorMsg.style.display = 'block';
-            emailInput.style.borderColor = '#EF4444';
-            return;
-          }
-          
-          if (!role) {
-            errorMsg.textContent = 'Please select or specify your role';
-            errorMsg.style.display = 'block';
-            roleSelect.style.borderColor = '#EF4444';
-            return;
-          }
-          
-          // Save email and role
-          this.userEmail = email;
-          this.userRole = role;
-          this.username = email.split('@')[0];
-          await this.safeChromeStorage(() => chrome.storage.sync.set({ 
-            userEmail: email,
-            userRole: role
-          }));
-          
-          console.log('✅ User registered:', this.username, 'Role:', role);
-          dialog.remove();
-          resolve();
-        };
-        
-        submitBtn.addEventListener('click', validateAndSubmit);
-        
-        const handleEnterKey = (e) => {
-          if (e.key === 'Enter') {
-            e.preventDefault();
-            validateAndSubmit();
-          }
-        };
-        
-        emailInput.addEventListener('keydown', handleEnterKey);
-        roleSelect.addEventListener('keydown', handleEnterKey);
-        roleCustomInput.addEventListener('keydown', handleEnterKey);
-        
-        emailInput.addEventListener('input', () => {
-          errorMsg.style.display = 'none';
-          emailInput.style.borderColor = '#ddd';
-        });
-        
-        roleSelect.addEventListener('input', () => {
-          errorMsg.style.display = 'none';
-          roleSelect.style.borderColor = '#ddd';
-        });
-        
-        roleCustomInput.addEventListener('input', () => {
-          errorMsg.style.display = 'none';
-          roleCustomInput.style.borderColor = '#ddd';
-        });
-      });
-    }
-    
-    // Check if database is configured, if not prompt for configuration
+    // Check whether a storage backend has been chosen; if not, point the user at the
+    // settings page.
+    // Decision: the configuration UI itself no longer lives in the content script. The
+    // database, Jira, AI and registration dialogs moved to options.html on the
+    // chrome-extension:// origin, because those forms held an AI API key, a Jira API
+    // token, database credentials and the user's email address in inputs that shared
+    // the host page's DOM, where any site could read them off the elements while a
+    // dialog was open (rejected: keeping them inside the closed shadow root — that
+    // stops the read, but secrets still have no business in a document the site
+    // controls, and one careless later change re-exposes them).
     async checkDatabaseConfiguration() {
       const result = await this.safeChromeStorage(() => chrome.storage.sync.get(['dbProvider']));
-      
+
       if (!result || !result.dbProvider) {
-        // Show database configuration dialog
-        await this.showDatabaseDialog();
+        this.showToast('⚙️ Open Cognito settings to choose where your notes are stored', 'info', 6000);
       }
     }
-    
-    // Show database configuration dialog
-    showDatabaseDialog() {
-      return new Promise((resolve) => {
-        const dialog = document.createElement('div');
-        dialog.className = 'dc-dialog-overlay';
-        dialog.style.zIndex = '10000000';
-        
-        dialog.innerHTML = `
-          <div class="dc-dialog" style="max-width: 550px; max-height: 80vh; display: flex; flex-direction: column;">
-            <div class="dc-dialog-header" style="padding: 1rem 1.25rem 0.75rem;">
-              <h3 style="margin: 0; font-size: 16px; font-weight: 600; color: #1F2937;">🗄️ Database Configuration</h3>
-              <p style="margin: 0.5rem 0 0; color: #6B7280; font-size: 12px; line-height: 1.4;">
-                Choose your database provider for team collaboration
-              </p>
-            </div>
-            <div class="dc-dialog-body" style="max-height: calc(80vh - 130px); overflow-y: auto; padding: 0 1.25rem;">
-              
-              <!-- Radio Button Provider Selection -->
-              <div style="display: flex; gap: 0.75rem; margin-bottom: 1.5rem; margin-top: 1rem; flex-wrap: wrap; justify-content: center;">
-                <div id="dc-local-storage-option" class="db-provider-radio" style="cursor: pointer;">
-                  <div class="db-provider-card">
-                    <div class="db-provider-icon">💾</div>
-                    <div class="db-provider-name">Local Storage</div>
-                    <div class="db-provider-tag">Solo Mode</div>
-                  </div>
-                </div>
-                
-                <label class="db-provider-radio">
-                  <input type="radio" name="db-provider" value="supabase" style="display: none;">
-                  <div class="db-provider-card">
-                    <div class="db-provider-icon">🚀</div>
-                    <div class="db-provider-name">Supabase</div>
-                    <div class="db-provider-tag">Recommended</div>
-                  </div>
-                </label>
-                
-                <label class="db-provider-radio">
-                  <input type="radio" name="db-provider" value="mongodb" style="display: none;">
-                  <div class="db-provider-card">
-                    <div class="db-provider-icon">🍃</div>
-                    <div class="db-provider-name">MongoDB Atlas</div>
-                    <div class="db-provider-tag">NoSQL</div>
-                  </div>
-                </label>
-              </div>
-              
-              <!-- Supabase Form -->
-              <div id="form-supabase" class="db-form" style="display: none;">
-                <div class="db-setup-guide">
-                  <div class="db-setup-guide-title">📚 Supabase Setup Steps:</div>
-                  <ol>
-                    <li>Go to <a href="https://supabase.com" target="_blank" style="color: #0066cc; font-weight: 500;">supabase.com</a> and create a free account</li>
-                    <li>Click <strong>"New Project"</strong> and fill in project details</li>
-                    <li>Once created, go to <strong>Settings → API</strong></li>
-                    <li>Copy the <strong>"Project URL"</strong> (looks like https://xxxxx.supabase.co)</li>
-                    <li>Copy the <strong>"anon public"</strong> API key</li>
-                    <li>Go to <strong>SQL Editor</strong> and run this SQL:
-                      <div style="position: relative; margin-top: 0.75rem;">
-                        <button class="dc-copy-sql-btn" id="dc-copy-sql-btn" title="Copy SQL command" style="position: absolute; top: 0.5rem; right: 0.5rem; background: rgba(255, 255, 255, 0.9); border: 1px solid #E5E7EB; border-radius: 4px; padding: 0.375rem 0.5rem; cursor: pointer; display: flex; align-items: center; gap: 0.25rem; font-size: 11px; color: #6B7280; transition: all 0.2s; z-index: 10;">
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                          </svg>
-                          <span class="dc-copy-text">Copy</span>
-                        </button>
-                        <pre id="dc-sql-command">CREATE TABLE cognito_comments (
-  id TEXT PRIMARY KEY,
-  text TEXT,
-  link TEXT,
-  "commentType" TEXT,
-  type TEXT,
-  timestamp TEXT,
-  author TEXT,
-  "pageId" TEXT,
-  "parentId" TEXT,
-  replies JSONB,
-  "chartHash" TEXT,
-  "chartLabel" TEXT,
-  "relativeX" REAL,
-  "relativeY" REAL,
-  "filterState" JSONB,
-  "jiraTicket" JSONB,
-  "targetId" TEXT,
-  "targetPath" TEXT
-);</pre>
-                      </div>
-                    </li>
-                    <li>Enter your Project URL and API Key below</li>
-                  </ol>
-                </div>
-                
-                <div class="db-form-field">
-                  <label class="db-form-label">Supabase Project URL</label>
-                  <input 
-                    type="url" 
-                    id="dc-supabase-url" 
-                    class="db-form-input" 
-                    placeholder="https://xxxxx.supabase.co"
-                  >
-                </div>
-                
-                <div class="db-form-field">
-                  <label class="db-form-label">Supabase API Key (anon public)</label>
-                  <div style="position: relative;">
-                    <input 
-                      type="password" 
-                      id="dc-supabase-key" 
-                      class="db-form-input" 
-                      placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-                      style="padding-right: 2.5rem;"
-                    >
-                    <button type="button" class="dc-toggle-password" id="dc-toggle-supabase-key" style="position: absolute; right: 0.5rem; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; padding: 0.25rem; display: flex; align-items: center; justify-content: center; color: #6B7280; transition: color 0.2s;" title="Show/Hide API Key">
-                      <svg id="dc-eye-icon-supabase-key" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
-                        <circle cx="12" cy="12" r="3"></circle>
-                      </svg>
-                      <svg id="dc-eye-off-icon-supabase-key" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
-                        <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
-                        <line x1="1" y1="1" x2="23" y2="23"></line>
-                      </svg>
-                    </button>
-                  </div>
-                </div>
-                
-                <div id="dc-db-loader" style="display: none; margin-top: 0.75rem; padding: 0.75rem; background: #F3F4F6; border-radius: 6px;">
-                  <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem;">
-                    <div style="display: flex; align-items: center; gap: 0.5rem;">
-                      <div class="dc-loading-spinner" style="width: 16px; height: 16px; border: 2px solid #E5E7EB; border-top: 2px solid #667eea; border-radius: 50%; animation: spin 0.8s linear infinite;"></div>
-                      <span style="font-size: 12px; color: #6B7280; font-weight: 500;">Testing connection...</span>
-                    </div>
-                    <button type="button" class="dc-copy-logs-btn" id="dc-copy-db-logs-btn-supabase" style="display: none; background: white; border: 1px solid #E5E7EB; border-radius: 4px; padding: 0.25rem 0.5rem; cursor: pointer; font-size: 11px; color: #6B7280; transition: all 0.2s; display: flex; align-items: center; gap: 0.25rem;" title="Copy logs">
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                      </svg>
-                      <span class="dc-copy-logs-text">Copy</span>
-                    </button>
-                  </div>
-                  <div id="dc-db-logs" style="font-size: 11px; color: #6B7280; line-height: 1.5; max-height: 120px; overflow-y: auto; font-family: 'Monaco', 'Courier New', monospace; background: white; padding: 0.5rem; border-radius: 4px; border: 1px solid #E5E7EB; white-space: pre-wrap; word-wrap: break-word; text-align: left; direction: ltr;"></div>
-                </div>
-                <p id="dc-db-error" style="color: #EF4444; font-size: 11px; margin-top: 0.5rem; display: none;"></p>
-                <p id="dc-db-success" style="color: #10B981; font-size: 11px; margin-top: 0.5rem; display: none;">✅ Connection successful!</p>
-              </div>
-              
-              <!-- MongoDB Form -->
-              <div id="form-mongodb" class="db-form" style="display: none;">
-                <div class="db-setup-guide">
-                  <div class="db-setup-guide-title">📚 MongoDB Atlas Setup Steps:</div>
-                  <ol>
-                    <li>Go to <a href="https://www.mongodb.com/cloud/atlas/register" target="_blank" style="color: #0066cc; font-weight: 500;">mongodb.com/cloud/atlas</a> and create a free account</li>
-                    <li>Create a <strong>free M0 cluster</strong> (Shared tier)</li>
-                    <li>Set up database access: <strong>Security → Database Access → Add New User</strong></li>
-                    <li>Set up network access: <strong>Security → Network Access → Add IP Address → Allow Access from Anywhere (0.0.0.0/0)</strong></li>
-                    <li>Enable Data API:
-                      <ul>
-                        <li>Go to <strong>Data API</strong> in left sidebar</li>
-                        <li>Click <strong>"Enable the Data API"</strong></li>
-                        <li>Copy the <strong>"URL Endpoint"</strong></li>
-                        <li>Create an <strong>API Key</strong> and copy it</li>
-                      </ul>
-                    </li>
-                    <li>Create database and collection:
-                      <ul>
-                        <li>Go to <strong>Database → Browse Collections</strong></li>
-                        <li>Click <strong>"Add My Own Data"</strong></li>
-                        <li>Database Name: <code style="background: #FEFCE8; padding: 0.125rem 0.25rem; border-radius: 3px;">cognito</code></li>
-                        <li>Collection Name: <code style="background: #FEFCE8; padding: 0.125rem 0.25rem; border-radius: 3px;">comments</code></li>
-                      </ul>
-                    </li>
-                    <li>Run this MongoDB command to create the collection structure (or use MongoDB Compass/Shell):
-                      <div style="position: relative; margin-top: 0.75rem;">
-                        <button class="dc-copy-sql-btn" id="dc-copy-mongo-btn" title="Copy MongoDB command" style="position: absolute; top: 0.5rem; right: 0.5rem; background: rgba(255, 255, 255, 0.9); border: 1px solid #E5E7EB; border-radius: 4px; padding: 0.375rem 0.5rem; cursor: pointer; display: flex; align-items: center; gap: 0.25rem; font-size: 11px; color: #6B7280; transition: all 0.2s; z-index: 10;">
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                          </svg>
-                          <span class="dc-copy-text">Copy</span>
-                        </button>
-                        <pre id="dc-mongo-command">// MongoDB Shell Command
-// Run this in MongoDB Compass or MongoDB Shell after connecting to your cluster
 
-use cognito;
-
-db.createCollection("comments");
-
-// Create indexes for better performance
-db.comments.createIndex({ "pageId": 1 });
-db.comments.createIndex({ "chartHash": 1 });
-db.comments.createIndex({ "author": 1 });
-db.comments.createIndex({ "timestamp": -1 });
-
-// Sample document structure (collection is created automatically on first insert)
-// {
-//   "id": "string (unique)",
-//   "text": "string",
-//   "link": "string",
-//   "commentType": "string",
-//   "type": "string (bubble|page)",
-//   "timestamp": "string (ISO 8601)",
-//   "author": "string",
-//   "pageId": "string",
-//   "parentId": "string|null",
-//   "replies": [],
-//   "chartHash": "string",
-//   "chartLabel": "string",
-//   "relativeX": "number",
-//   "relativeY": "number",
-//   "filterState": { "from": "string", "to": "string", "timezone": "string" },
-//   "jiraTicket": { "key": "string", "url": "string" }
-// }</pre>
-                      </div>
-                    </li>
-                    <li>Enter your Data API URL, API Key, and Database Name below</li>
-                  </ol>
-                </div>
-                
-                <div class="db-form-field">
-                  <label class="db-form-label">MongoDB Data API URL</label>
-                  <input 
-                    type="url" 
-                    id="dc-mongodb-url" 
-                    class="db-form-input" 
-                    placeholder="https://data.mongodb-api.com/app/data-xxxxx/endpoint/data/v1"
-                  >
-                </div>
-                
-                <div class="db-form-field">
-                  <label class="db-form-label">MongoDB API Key</label>
-                  <div style="position: relative;">
-                    <input 
-                      type="password" 
-                      id="dc-mongodb-key" 
-                      class="db-form-input" 
-                      placeholder="Your MongoDB Data API Key"
-                      style="padding-right: 2.5rem;"
-                    >
-                    <button type="button" class="dc-toggle-password" id="dc-toggle-mongodb-key" style="position: absolute; right: 0.5rem; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; padding: 0.25rem; display: flex; align-items: center; justify-content: center; color: #6B7280; transition: color 0.2s;" title="Show/Hide API Key">
-                      <svg id="dc-eye-icon-mongodb-key" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
-                        <circle cx="12" cy="12" r="3"></circle>
-                      </svg>
-                      <svg id="dc-eye-off-icon-mongodb-key" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
-                        <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
-                        <line x1="1" y1="1" x2="23" y2="23"></line>
-                      </svg>
-                    </button>
-                  </div>
-                </div>
-                
-                <div class="db-form-field">
-                  <label class="db-form-label">Database Name</label>
-                  <input 
-                    type="text" 
-                    id="dc-mongodb-database" 
-                    class="db-form-input" 
-                    placeholder="cognito"
-                    value="cognito"
-                  >
-                </div>
-                
-                <div id="dc-db-loader" style="display: none; margin-top: 0.75rem; padding: 0.75rem; background: #F3F4F6; border-radius: 6px;">
-                  <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem;">
-                    <div style="display: flex; align-items: center; gap: 0.5rem;">
-                      <div class="dc-loading-spinner" style="width: 16px; height: 16px; border: 2px solid #E5E7EB; border-top: 2px solid #667eea; border-radius: 50%; animation: spin 0.8s linear infinite;"></div>
-                      <span style="font-size: 12px; color: #6B7280; font-weight: 500;">Testing connection...</span>
-                    </div>
-                    <button type="button" class="dc-copy-logs-btn" id="dc-copy-db-logs-btn-mongo" style="display: none; background: white; border: 1px solid #E5E7EB; border-radius: 4px; padding: 0.25rem 0.5rem; cursor: pointer; font-size: 11px; color: #6B7280; transition: all 0.2s; display: flex; align-items: center; gap: 0.25rem;" title="Copy logs">
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                      </svg>
-                      <span class="dc-copy-logs-text">Copy</span>
-                    </button>
-                  </div>
-                  <div id="dc-db-logs" style="font-size: 11px; color: #6B7280; line-height: 1.5; max-height: 120px; overflow-y: auto; font-family: 'Monaco', 'Courier New', monospace; background: white; padding: 0.5rem; border-radius: 4px; border: 1px solid #E5E7EB; white-space: pre-wrap; word-wrap: break-word; text-align: left; direction: ltr;"></div>
-                </div>
-                <p id="dc-db-error" style="color: #EF4444; font-size: 11px; margin-top: 0.5rem; display: none;"></p>
-                <p id="dc-db-success" style="color: #10B981; font-size: 11px; margin-top: 0.5rem; display: none;">✅ Connection successful!</p>
-              </div>
-              
-            </div>
-            <div class="dc-dialog-footer" style="display: flex; gap: 0.5rem; padding: 0.75rem 1.25rem; border-top: 1px solid #F3F4F6;">
-              <button class="dc-btn dc-btn-secondary" id="dc-db-cancel" style="flex: 1; padding: 0.5rem; font-size: 13px;">
-                Cancel
-              </button>
-              <button class="dc-btn dc-btn-primary" id="dc-db-test" style="flex: 1; padding: 0.5rem; font-size: 13px;">
-                🔍 Test
-              </button>
-              <button class="dc-btn dc-btn-primary" id="dc-db-save" style="flex: 1; padding: 0.5rem; font-size: 13px;" disabled>
-                Save
-              </button>
-            </div>
-          </div>
-        `;
-        
-        document.body.appendChild(dialog);
-        
-        // Copy SQL command button handler
-        const copySqlBtn = dialog.querySelector('#dc-copy-sql-btn');
-        if (copySqlBtn) {
-          copySqlBtn.addEventListener('click', async () => {
-            const sqlCommand = dialog.querySelector('#dc-sql-command');
-            if (sqlCommand) {
-              const sqlText = sqlCommand.textContent || sqlCommand.innerText;
-              try {
-                await navigator.clipboard.writeText(sqlText);
-                const copyText = copySqlBtn.querySelector('.dc-copy-text');
-                const originalText = copyText.textContent;
-                copyText.textContent = 'Copied!';
-                copySqlBtn.style.background = '#10B981';
-                copySqlBtn.style.color = 'white';
-                copySqlBtn.style.borderColor = '#10B981';
-                
-                setTimeout(() => {
-                  copyText.textContent = originalText;
-                  copySqlBtn.style.background = 'rgba(255, 255, 255, 0.9)';
-                  copySqlBtn.style.color = '#6B7280';
-                  copySqlBtn.style.borderColor = '#E5E7EB';
-                }, 2000);
-              } catch (err) {
-                console.error('Failed to copy SQL command:', err);
-                // Fallback for older browsers
-                const textArea = document.createElement('textarea');
-                textArea.value = sqlText;
-                textArea.style.position = 'fixed';
-                textArea.style.opacity = '0';
-                document.body.appendChild(textArea);
-                textArea.select();
-                try {
-                  document.execCommand('copy');
-                  const copyText = copySqlBtn.querySelector('.dc-copy-text');
-                  const originalText = copyText.textContent;
-                  copyText.textContent = 'Copied!';
-                  copySqlBtn.style.background = '#10B981';
-                  copySqlBtn.style.color = 'white';
-                  copySqlBtn.style.borderColor = '#10B981';
-                  
-                  setTimeout(() => {
-                    copyText.textContent = originalText;
-                    copySqlBtn.style.background = 'rgba(255, 255, 255, 0.9)';
-                    copySqlBtn.style.color = '#6B7280';
-                    copySqlBtn.style.borderColor = '#E5E7EB';
-                  }, 2000);
-                } catch (fallbackErr) {
-                  console.error('Fallback copy failed:', fallbackErr);
-                  alert('Failed to copy. Please select and copy manually.');
-                }
-                document.body.removeChild(textArea);
-              }
-            }
-          });
-        }
-        
-        // Copy MongoDB command button handler
-        const copyMongoBtn = dialog.querySelector('#dc-copy-mongo-btn');
-        if (copyMongoBtn) {
-          copyMongoBtn.addEventListener('click', async () => {
-            const mongoCommand = dialog.querySelector('#dc-mongo-command');
-            if (mongoCommand) {
-              const mongoText = mongoCommand.textContent || mongoCommand.innerText;
-              try {
-                await navigator.clipboard.writeText(mongoText);
-                const copyText = copyMongoBtn.querySelector('.dc-copy-text');
-                const originalText = copyText.textContent;
-                copyText.textContent = 'Copied!';
-                copyMongoBtn.style.background = '#10B981';
-                copyMongoBtn.style.color = 'white';
-                copyMongoBtn.style.borderColor = '#10B981';
-                
-                setTimeout(() => {
-                  copyText.textContent = originalText;
-                  copyMongoBtn.style.background = 'rgba(255, 255, 255, 0.9)';
-                  copyMongoBtn.style.color = '#6B7280';
-                  copyMongoBtn.style.borderColor = '#E5E7EB';
-                }, 2000);
-              } catch (err) {
-                console.error('Failed to copy MongoDB command:', err);
-                // Fallback for older browsers
-                const textArea = document.createElement('textarea');
-                textArea.value = mongoText;
-                textArea.style.position = 'fixed';
-                textArea.style.opacity = '0';
-                document.body.appendChild(textArea);
-                textArea.select();
-                try {
-                  document.execCommand('copy');
-                  const copyText = copyMongoBtn.querySelector('.dc-copy-text');
-                  const originalText = copyText.textContent;
-                  copyText.textContent = 'Copied!';
-                  copyMongoBtn.style.background = '#10B981';
-                  copyMongoBtn.style.color = 'white';
-                  copyMongoBtn.style.borderColor = '#10B981';
-                  
-                  setTimeout(() => {
-                    copyText.textContent = originalText;
-                    copyMongoBtn.style.background = 'rgba(255, 255, 255, 0.9)';
-                    copyMongoBtn.style.color = '#6B7280';
-                    copyMongoBtn.style.borderColor = '#E5E7EB';
-                  }, 2000);
-                } catch (fallbackErr) {
-                  console.error('Fallback copy failed:', fallbackErr);
-                  alert('Failed to copy. Please select and copy manually.');
-                }
-                document.body.removeChild(textArea);
-              }
-            }
-          });
-        }
-        
-        // Password toggle handlers for database dialog
-        const setupPasswordToggle = (toggleBtnId, inputId, eyeIconId, eyeOffIconId) => {
-          const toggleBtn = dialog.querySelector(toggleBtnId);
-          if (toggleBtn) {
-            toggleBtn.addEventListener('click', () => {
-              const input = dialog.querySelector(inputId);
-              const eyeIcon = dialog.querySelector(eyeIconId);
-              const eyeOffIcon = dialog.querySelector(eyeOffIconId);
-              
-              if (input && eyeIcon && eyeOffIcon) {
-                if (input.type === 'password') {
-                  input.type = 'text';
-                  eyeIcon.style.display = 'none';
-                  eyeOffIcon.style.display = 'block';
-                } else {
-                  input.type = 'password';
-                  eyeIcon.style.display = 'block';
-                  eyeOffIcon.style.display = 'none';
-                }
-              }
-            });
-          }
-        };
-        
-        // Setup password toggles for Supabase and MongoDB
-        setupPasswordToggle('#dc-toggle-supabase-key', '#dc-supabase-key', '#dc-eye-icon-supabase-key', '#dc-eye-off-icon-supabase-key');
-        setupPasswordToggle('#dc-toggle-mongodb-key', '#dc-mongodb-key', '#dc-eye-icon-mongodb-key', '#dc-eye-off-icon-mongodb-key');
-        
-        // Local Storage option click handler
-        const localStorageOption = document.getElementById('dc-local-storage-option');
-        localStorageOption.addEventListener('click', async () => {
-          console.log('💾 User selected Local Storage (Solo Mode)');
-          // Save the choice to prevent showing dialog again
-          await chrome.storage.sync.set({ dbProvider: 'local' });
-          dialog.remove();
-          resolve();
-        });
-        
-        // Provider selection handling
-        const providerRadios = dialog.querySelectorAll('input[name="db-provider"]');
-        const cancelBtn = document.getElementById('dc-db-cancel');
-        const testBtn = document.getElementById('dc-db-test');
-        const saveBtn = document.getElementById('dc-db-save');
-        
-        let selectedProvider = 'supabase'; // Default to Supabase
-        let connectionValid = false;
-        
-        // Cancel button
-        cancelBtn.addEventListener('click', async () => {
-          console.log('User cancelled database configuration');
-          // Save local storage as default to prevent showing dialog again
-          await chrome.storage.sync.set({ dbProvider: 'local' });
-          dialog.remove();
-          resolve();
-        });
-        
-        // Select Supabase by default and show its form
-        const supabaseRadio = dialog.querySelector('input[value="supabase"]');
-        supabaseRadio.checked = true;
-        document.getElementById('form-supabase').style.display = 'block';
-        
-        // Focus on first input after a short delay to ensure dialog is rendered
-        setTimeout(() => {
-          document.getElementById('dc-supabase-url').focus();
-        }, 100);
-        
-        // Handle provider selection
-        providerRadios.forEach(radio => {
-          radio.addEventListener('change', () => {
-            selectedProvider = radio.value;
-            
-            // Hide all forms
-            document.getElementById('form-supabase').style.display = 'none';
-            document.getElementById('form-mongodb').style.display = 'none';
-            
-            // Show selected form
-            document.getElementById(`form-${selectedProvider}`).style.display = 'block';
-            
-            // Reset validation state
-            connectionValid = false;
-            saveBtn.disabled = true;
-            testBtn.textContent = 'Test Connection';
-            testBtn.style.background = '';
-            testBtn.disabled = false;
-            
-            // Hide messages
-            const errorMsgs = dialog.querySelectorAll('[id="dc-db-error"]');
-            const successMsgs = dialog.querySelectorAll('[id="dc-db-success"]');
-            errorMsgs.forEach(msg => msg.style.display = 'none');
-            successMsgs.forEach(msg => msg.style.display = 'none');
-            
-            // Focus on first input
-            if (selectedProvider === 'supabase') {
-              document.getElementById('dc-supabase-url').focus();
-            } else if (selectedProvider === 'mongodb') {
-              document.getElementById('dc-mongodb-url').focus();
-            }
-          });
-        });
-        
-        // Test connection
-        testBtn.addEventListener('click', async () => {
-          if (!selectedProvider) {
-            alert('Please select a database provider first');
-            return;
-          }
-          
-          const errorMsg = dialog.querySelector(`#form-${selectedProvider} #dc-db-error`);
-          const successMsg = dialog.querySelector(`#form-${selectedProvider} #dc-db-success`);
-          const loader = dialog.querySelector(`#form-${selectedProvider} #dc-db-loader`);
-          const logs = dialog.querySelector(`#form-${selectedProvider} #dc-db-logs`);
-          
-          let config = {};
-          
-          if (selectedProvider === 'supabase') {
-            const url = document.getElementById('dc-supabase-url').value.trim();
-            const key = document.getElementById('dc-supabase-key').value.trim();
-            
-            if (!url || !key) {
-              errorMsg.textContent = 'Please enter both URL and API key';
-              errorMsg.style.display = 'block';
-              successMsg.style.display = 'none';
-              return;
-            }
-            
-            config = { supabaseUrl: url, supabaseKey: key };
-          } else if (selectedProvider === 'mongodb') {
-            const url = document.getElementById('dc-mongodb-url').value.trim();
-            const key = document.getElementById('dc-mongodb-key').value.trim();
-            const database = document.getElementById('dc-mongodb-database').value.trim();
-            
-            if (!url || !key || !database) {
-              errorMsg.textContent = 'Please fill in all fields';
-              errorMsg.style.display = 'block';
-              successMsg.style.display = 'none';
-              return;
-            }
-            
-            config = { mongoUrl: url, mongoApiKey: key, mongoDatabase: database };
-          }
-          
-          // Reset UI
-          testBtn.textContent = '⏳ Testing...';
-          testBtn.disabled = true;
-          testBtn.style.background = '';
-          errorMsg.style.display = 'none';
-          successMsg.style.display = 'none';
-          loader.style.display = 'block';
-          logs.textContent = '';
-          
-          // Get copy button - different IDs for Supabase and MongoDB
-          const copyBtn = dialog.querySelector(`#form-${selectedProvider} .dc-copy-logs-btn`);
-          if (copyBtn) {
-            copyBtn.style.display = 'none';
-          }
-          
-          // Helper function to add log
-          const addLog = (message, type = 'info') => {
-            const timestamp = new Date().toLocaleTimeString();
-            const icon = type === 'error' ? '❌' : type === 'success' ? '✅' : '🔍';
-            const logLine = `[${timestamp}] ${icon} ${message}`;
-            
-            // Append to textContent for easy copying
-            if (logs.textContent) {
-              logs.textContent += '\n' + logLine;
-            } else {
-              logs.textContent = logLine;
-            }
-            
-            logs.scrollTop = logs.scrollHeight;
-            
-            // Show copy button when logs are present
-            if (copyBtn && logs.textContent.trim()) {
-              copyBtn.style.display = 'flex';
-            }
-          };
-          
-          // Copy button functionality
-          if (copyBtn) {
-            copyBtn.onclick = async () => {
-              try {
-                const logText = logs.textContent || '';
-                if (!logText.trim()) {
-                  return;
-                }
-                
-                await navigator.clipboard.writeText(logText);
-                
-                // Visual feedback
-                const originalText = copyBtn.querySelector('.dc-copy-logs-text').textContent;
-                copyBtn.querySelector('.dc-copy-logs-text').textContent = 'Copied!';
-                copyBtn.style.background = '#10B981';
-                copyBtn.style.borderColor = '#10B981';
-                copyBtn.style.color = 'white';
-                
-                setTimeout(() => {
-                  copyBtn.querySelector('.dc-copy-logs-text').textContent = originalText;
-                  copyBtn.style.background = 'white';
-                  copyBtn.style.borderColor = '#E5E7EB';
-                  copyBtn.style.color = '#6B7280';
-                }, 2000);
-              } catch (err) {
-                console.error('Failed to copy logs:', err);
-              }
-            };
-          }
-          
-          // Set up timeout (increased to 25 seconds to allow for network latency)
-          const TIMEOUT_MS = 25000; // 25 seconds
-          let timeoutId;
-          const timeoutPromise = new Promise((_, reject) => {
-            timeoutId = setTimeout(() => {
-              addLog('Connection timeout - request may still be processing on server', 'error');
-              reject(new Error('Connection timeout after 25 seconds. The request may have reached the server but the response took too long. Please check your network connection.'));
-            }, TIMEOUT_MS);
-          });
-          
-          try {
-            addLog(`Starting ${selectedProvider === 'supabase' ? 'Supabase' : 'MongoDB'} connection test...`);
-            addLog(`Connecting to: ${selectedProvider === 'supabase' ? config.supabaseUrl : config.mongoUrl}`);
-            
-            // Race between timeout and connection test
-            const testPromise = this.db.testConnection(selectedProvider, config, addLog);
-            const isValid = await Promise.race([testPromise, timeoutPromise]);
-            
-            clearTimeout(timeoutId);
-            
-            console.log('🔍 Database test result:', isValid);
-            
-            if (isValid) {
-              addLog('Connection successful!', 'success');
-              loader.style.display = 'none'; // Stop loader immediately on success
-              successMsg.textContent = '✅ Database connection successful!';
-              successMsg.style.display = 'block';
-              errorMsg.style.display = 'none';
-              connectionValid = true;
-              saveBtn.disabled = false;
-              testBtn.textContent = '✅ Connected';
-              testBtn.style.background = '#10B981';
-              testBtn.disabled = false;
-            } else {
-              addLog('Connection failed. Please check your credentials.', 'error');
-              loader.style.display = 'none'; // Stop loader immediately on failure
-              errorMsg.textContent = '❌ Connection failed. Please check your credentials and try again.';
-              errorMsg.style.display = 'block';
-              successMsg.style.display = 'none';
-              connectionValid = false;
-              saveBtn.disabled = true;
-              testBtn.textContent = '🔍 Test Connection';
-              testBtn.style.background = '';
-              testBtn.disabled = false;
-            }
-          } catch (error) {
-            clearTimeout(timeoutId);
-            console.error('🔍 Database test error:', error);
-            addLog(`Error: ${error.message}`, 'error');
-            loader.style.display = 'none'; // Stop loader immediately on error/timeout
-            errorMsg.textContent = `❌ Connection failed: ${error.message || 'Unknown error'}`;
-            errorMsg.style.display = 'block';
-            successMsg.style.display = 'none';
-            connectionValid = false;
-            saveBtn.disabled = true;
-            testBtn.textContent = '🔍 Test Connection';
-            testBtn.style.background = '';
-            testBtn.disabled = false;
-          }
-        });
-        
-        // Save configuration
-        saveBtn.addEventListener('click', async () => {
-          if (!connectionValid) {
-            alert('Please test connection first');
-            return;
-          }
-          
-          let config = { dbProvider: selectedProvider };
-          
-          if (selectedProvider === 'supabase') {
-            config.supabaseUrl = document.getElementById('dc-supabase-url').value.trim();
-            config.supabaseKey = document.getElementById('dc-supabase-key').value.trim();
-          } else if (selectedProvider === 'mongodb') {
-            config.mongoUrl = document.getElementById('dc-mongodb-url').value.trim();
-            config.mongoApiKey = document.getElementById('dc-mongodb-key').value.trim();
-            config.mongoDatabase = document.getElementById('dc-mongodb-database').value.trim();
-          }
-          
-          await chrome.storage.sync.set(config);
-          
-          // Reinitialize database
-          await this.db.init();
-          
-          console.log('✅ Database configuration saved');
-          this.showToast(`Database configured with ${selectedProvider === 'supabase' ? 'Supabase' : 'MongoDB'}!`);
-          dialog.remove();
-          resolve();
-        });
-      });
-    }
-    
-    // Show Jira configuration dialog
-    showJiraConfigDialog() {
-      return new Promise((resolve) => {
-        const dialog = document.createElement('div');
-        dialog.className = 'dc-dialog-overlay';
-        dialog.style.zIndex = '10000000';
-        
-        dialog.innerHTML = `
-          <div class="dc-dialog" style="max-width: 550px; max-height: 80vh; display: flex; flex-direction: column;">
-            <div class="dc-dialog-header" style="padding: 1rem 1.25rem 0.75rem;">
-              <h3 style="margin: 0; font-size: 16px; font-weight: 600; color: #1F2937; display: flex; align-items: center; gap: 0.5rem;">
-                <img src="${chrome.runtime.getURL('icons/atlassian.png')}" alt="Atlassian" style="width: 20px; height: 20px;">
-                Atlassian Integration
-              </h3>
-              <p style="margin: 0.5rem 0 0; color: #6B7280; font-size: 12px; line-height: 1.4;">
-                Connect your Jira account to create and attach tickets
-              </p>
-            </div>
-            <div class="dc-dialog-body" style="padding: 0 1.25rem; max-height: calc(80vh - 140px); overflow-y: auto;">
-              <div class="dc-form-group">
-                <label class="dc-form-label">Jira URL</label>
-                <input 
-                  type="url" 
-                  id="dc-jira-url" 
-                  class="dc-form-input" 
-                  placeholder="https://yourcompany.atlassian.net"
-                  value="${this.jira.jiraUrl || ''}"
-                >
-              </div>
-              
-              <div class="dc-form-group">
-                <label class="dc-form-label">Email</label>
-                <input 
-                  type="email" 
-                  id="dc-jira-email" 
-                  class="dc-form-input" 
-                  placeholder="your.email@company.com"
-                  value="${this.jira.jiraEmail || ''}"
-                >
-              </div>
-              
-              <div class="dc-form-group">
-                <label class="dc-form-label">
-                  API Token 
-                  <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" style="font-size: 11px; color: #3B82F6; text-decoration: none;">Get Token</a>
-                </label>
-                <div style="position: relative;">
-                  <input 
-                    type="password" 
-                    id="dc-jira-token" 
-                    class="dc-form-input" 
-                    placeholder="Your Jira API Token"
-                    value="${this.jira.jiraApiToken || ''}"
-                    style="padding-right: 2.5rem;"
-                  >
-                  <button type="button" class="dc-toggle-password" id="dc-toggle-jira-token" style="position: absolute; right: 0.5rem; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; padding: 0.25rem; display: flex; align-items: center; justify-content: center; color: #6B7280; transition: color 0.2s;" title="Show/Hide API Token">
-                    <svg id="dc-eye-icon-jira-token" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
-                      <circle cx="12" cy="12" r="3"></circle>
-                    </svg>
-                    <svg id="dc-eye-off-icon-jira-token" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
-                      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
-                      <line x1="1" y1="1" x2="23" y2="23"></line>
-                    </svg>
-                  </button>
-                </div>
-              </div>
-              
-              <div class="dc-info-box" style="background: #F0F9FF; border: 1px solid #BAE6FD; border-radius: 8px; padding: 0.75rem; margin-top: 0.75rem; font-size: 11px; line-height: 1.4;">
-                <div style="display: flex; align-items: center; margin-bottom: 0.25rem;">
-                  <span style="font-size: 12px; margin-right: 0.25rem;">💡</span>
-                  <strong style="font-size: 12px; color: #0369A1;">Setup Steps:</strong>
-                </div>
-                <div style="color: #0369A1; margin-left: 1rem;">
-                  1. Go to your Jira instance<br>
-                  2. Click your profile → Account settings<br>
-                  3. Security → API tokens → Create token<br>
-                  4. Copy token and paste above
-                </div>
-              </div>
-              
-              <div id="dc-jira-loader" style="display: none; margin-top: 0.75rem; padding: 0.75rem; background: #F3F4F6; border-radius: 6px;">
-                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem;">
-                  <div style="display: flex; align-items: center; gap: 0.5rem;">
-                    <div class="dc-loading-spinner" style="width: 16px; height: 16px; border: 2px solid #E5E7EB; border-top: 2px solid #667eea; border-radius: 50%; animation: spin 0.8s linear infinite;"></div>
-                    <span style="font-size: 12px; color: #6B7280; font-weight: 500;">Testing connection...</span>
-                  </div>
-                  <button type="button" class="dc-copy-logs-btn" id="dc-copy-jira-logs-btn" style="display: none; background: white; border: 1px solid #E5E7EB; border-radius: 4px; padding: 0.25rem 0.5rem; cursor: pointer; font-size: 11px; color: #6B7280; transition: all 0.2s; display: flex; align-items: center; gap: 0.25rem;" title="Copy logs">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                    </svg>
-                    <span class="dc-copy-logs-text">Copy</span>
-                  </button>
-                </div>
-                <div id="dc-jira-logs" style="font-size: 11px; color: #6B7280; line-height: 1.5; max-height: 120px; overflow-y: auto; font-family: 'Monaco', 'Courier New', monospace; background: white; padding: 0.5rem; border-radius: 4px; border: 1px solid #E5E7EB; white-space: pre-wrap; word-wrap: break-word; text-align: left; direction: ltr;"></div>
-              </div>
-              <p id="dc-jira-error" style="color: #EF4444; font-size: 11px; margin-top: 0.75rem; display: none;"></p>
-              <p id="dc-jira-success" style="color: #10B981; font-size: 11px; margin-top: 0.75rem; display: none;">✅ Connection successful!</p>
-            </div>
-            <div class="dc-dialog-footer" style="padding: 0.75rem 1.25rem 1rem; display: flex; gap: 0.5rem; border-top: 1px solid #F3F4F6;">
-              <button class="dc-btn dc-btn-secondary" id="dc-jira-close" style="flex: 1; padding: 0.5rem; font-size: 13px;">
-                Cancel
-              </button>
-              <button class="dc-btn dc-btn-primary" id="dc-jira-test" style="flex: 1; padding: 0.5rem; font-size: 13px;">
-                🔍 Test
-              </button>
-              <button class="dc-btn dc-btn-primary" id="dc-jira-save" style="flex: 1; padding: 0.5rem; font-size: 13px;" disabled>
-                Save
-              </button>
-            </div>
-          </div>
-        `;
-        
-        document.body.appendChild(dialog);
-        
-        // Password toggle handler for JIRA token
-        const jiraToggleBtn = dialog.querySelector('#dc-toggle-jira-token');
-        if (jiraToggleBtn) {
-          jiraToggleBtn.addEventListener('click', () => {
-            const tokenInput = document.getElementById('dc-jira-token');
-            const eyeIcon = dialog.querySelector('#dc-eye-icon-jira-token');
-            const eyeOffIcon = dialog.querySelector('#dc-eye-off-icon-jira-token');
-            
-            if (tokenInput && eyeIcon && eyeOffIcon) {
-              if (tokenInput.type === 'password') {
-                tokenInput.type = 'text';
-                eyeIcon.style.display = 'none';
-                eyeOffIcon.style.display = 'block';
-              } else {
-                tokenInput.type = 'password';
-                eyeIcon.style.display = 'block';
-                eyeOffIcon.style.display = 'none';
-              }
-            }
-          });
-        }
-        
-        const urlInput = document.getElementById('dc-jira-url');
-        const emailInput = document.getElementById('dc-jira-email');
-        const tokenInput = document.getElementById('dc-jira-token');
-        const errorMsg = document.getElementById('dc-jira-error');
-        const successMsg = document.getElementById('dc-jira-success');
-        const closeBtn = document.getElementById('dc-jira-close');
-        const testBtn = document.getElementById('dc-jira-test');
-        const saveBtn = document.getElementById('dc-jira-save');
-        
-        let connectionValid = false;
-        
-        if (this.jira.isConfigured) {
-          connectionValid = true;
-          saveBtn.disabled = false;
-        }
-        
-        closeBtn.addEventListener('click', () => {
-          dialog.remove();
-          resolve();
-        });
-        
-        testBtn.addEventListener('click', async () => {
-          const url = urlInput.value.trim().replace(/\/$/, ''); // Remove trailing slash
-          const email = emailInput.value.trim();
-          const token = tokenInput.value.trim();
-          
-          if (!url || !email || !token) {
-            errorMsg.textContent = 'Please fill all fields';
-            errorMsg.style.display = 'block';
-            successMsg.style.display = 'none';
-            return;
-          }
-          
-          const loader = document.getElementById('dc-jira-loader');
-          const logs = document.getElementById('dc-jira-logs');
-          const copyBtn = document.getElementById('dc-copy-jira-logs-btn');
-          
-          // Reset UI
-          testBtn.textContent = '⏳ Testing...';
-          testBtn.disabled = true;
-          testBtn.style.background = '';
-          errorMsg.style.display = 'none';
-          successMsg.style.display = 'none';
-          loader.style.display = 'block';
-          logs.textContent = '';
-          
-          if (copyBtn) {
-            copyBtn.style.display = 'none';
-          }
-          
-          // Add log helper
-          const addLog = (message, type = 'info') => {
-            const timestamp = new Date().toLocaleTimeString();
-            const prefix = type === 'error' ? '❌' : type === 'success' ? '✅' : '🔍';
-            const logLine = `[${timestamp}] ${prefix} ${message}`;
-            
-            // Append to textContent for easy copying
-            if (logs.textContent) {
-              logs.textContent += '\n' + logLine;
-            } else {
-              logs.textContent = logLine;
-            }
-            
-            logs.scrollTop = logs.scrollHeight;
-            console.log(`[JIRA-TEST] ${message}`);
-            
-            // Show copy button when logs are present
-            if (copyBtn && logs.textContent.trim()) {
-              copyBtn.style.display = 'flex';
-            }
-          };
-          
-          // Copy button functionality
-          if (copyBtn) {
-            copyBtn.onclick = async () => {
-              try {
-                const logText = logs.textContent || '';
-                if (!logText.trim()) {
-                  return;
-                }
-                
-                await navigator.clipboard.writeText(logText);
-                
-                // Visual feedback
-                const originalText = copyBtn.querySelector('.dc-copy-logs-text').textContent;
-                copyBtn.querySelector('.dc-copy-logs-text').textContent = 'Copied!';
-                copyBtn.style.background = '#10B981';
-                copyBtn.style.borderColor = '#10B981';
-                copyBtn.style.color = 'white';
-                
-                setTimeout(() => {
-                  copyBtn.querySelector('.dc-copy-logs-text').textContent = originalText;
-                  copyBtn.style.background = 'white';
-                  copyBtn.style.borderColor = '#E5E7EB';
-                  copyBtn.style.color = '#6B7280';
-                }, 2000);
-              } catch (err) {
-                console.error('Failed to copy logs:', err);
-              }
-            };
-          }
-          
-          addLog('Starting Jira connection test...');
-          addLog(`Jira URL: ${url}`);
-          addLog(`Email: ${email}`);
-          addLog(`API Token: ${token.substring(0, 10)}...`);
-          
-          // Temporarily set credentials for testing
-          this.jira.jiraUrl = url;
-          this.jira.jiraEmail = email;
-          this.jira.jiraApiToken = token;
-          
-          try {
-            const result = await this.jira.testConnection(addLog);
-            console.log('🔍 Jira test result:', result);
-            
-            if (result.success) {
-              addLog(`Connection successful! User: ${result.user}`, 'success');
-              loader.style.display = 'none'; // Stop loader on success
-              successMsg.textContent = `✅ Connected as ${result.user}`;
-              successMsg.style.display = 'block';
-              errorMsg.style.display = 'none';
-              connectionValid = true;
-              saveBtn.disabled = false;
-              testBtn.textContent = '✅ Connected';
-              testBtn.style.background = '#10B981';
-              testBtn.disabled = false;
-            } else {
-              addLog(`Connection failed: ${result.error}`, 'error');
-              loader.style.display = 'none'; // Stop loader on failure
-              errorMsg.textContent = `❌ ${result.error}`;
-              errorMsg.style.display = 'block';
-              successMsg.style.display = 'none';
-              connectionValid = false;
-              saveBtn.disabled = true;
-              testBtn.textContent = '🔍 Test';
-              testBtn.style.background = '';
-              testBtn.disabled = false;
-            }
-          } catch (error) {
-            addLog(`Error: ${error.message}`, 'error');
-            console.error('🔍 Jira test error:', error);
-            loader.style.display = 'none'; // Stop loader on error
-            errorMsg.textContent = `❌ Connection failed: ${error.message}`;
-            errorMsg.style.display = 'block';
-            successMsg.style.display = 'none';
-            connectionValid = false;
-            saveBtn.disabled = true;
-            testBtn.textContent = '🔍 Test';
-            testBtn.style.background = '';
-            testBtn.disabled = false;
-          } finally {
-            // Keep loader visible to show logs
-            setTimeout(() => {
-              // Optionally hide loader after a delay, or keep it visible
-            }, 100);
-          }
-        });
-        
-        saveBtn.addEventListener('click', async () => {
-          if (!connectionValid) {
-            errorMsg.textContent = 'Please test connection first';
-            errorMsg.style.display = 'block';
-            return;
-          }
-          
-          const url = urlInput.value.trim().replace(/\/$/, '');
-          const email = emailInput.value.trim();
-          const token = tokenInput.value.trim();
-          
-          await chrome.storage.sync.set({ 
-            jiraUrl: url, 
-            jiraEmail: email,
-            jiraApiToken: token
-          });
-          
-          this.jira.jiraUrl = url;
-          this.jira.jiraEmail = email;
-          this.jira.jiraApiToken = token;
-          this.jira.isConfigured = true;
-          
-          this.showToast('✅ Jira configuration saved!');
-          dialog.remove();
-          resolve();
-        });
-        
-        [urlInput, emailInput, tokenInput].forEach(input => {
-          input.addEventListener('input', () => {
-            errorMsg.style.display = 'none';
-            successMsg.style.display = 'none';
-            connectionValid = false;
-            saveBtn.disabled = true;
-            testBtn.textContent = '🔍 Test Connection';
-            testBtn.disabled = false;
-            testBtn.style.background = '';
-          });
-        });
-      });
-    }
-    
-    // Show AI configuration dialog
-    showAIConfigDialog() {
-      return new Promise((resolve) => {
-        const dialog = document.createElement('div');
-        dialog.className = 'dc-dialog-overlay';
-        dialog.style.zIndex = '10000000';
-        
-        dialog.innerHTML = `
-          <div class="dc-dialog" style="max-width: 550px; max-height: 80vh; display: flex; flex-direction: column;">
-            <div class="dc-dialog-header" style="padding: 1rem 1.25rem 0.75rem;">
-              <h3 style="margin: 0; font-size: 16px; font-weight: 600; color: #1F2937;">🤖 AI Configuration</h3>
-              <p style="margin: 0.5rem 0 0; color: #6B7280; font-size: 12px; line-height: 1.4;">
-                Enable AI-powered chart analysis and insights
-              </p>
-            </div>
-            <div class="dc-dialog-body" style="padding: 0 1.25rem; max-height: calc(80vh - 140px); overflow-y: auto;">
-              <div class="dc-form-group">
-                <label class="dc-form-label">AI Provider</label>
-        <select id="dc-ai-provider" class="dc-form-input">
-          <option value="">Select Provider</option>
-          <option value="openai" ${this.ai.provider === 'openai' ? 'selected' : ''}>OpenAI</option>
-          <option value="anthropic" ${this.ai.provider === 'anthropic' ? 'selected' : ''}>Anthropic</option>
-          <option value="gemini" ${this.ai.provider === 'gemini' ? 'selected' : ''}>Google Gemini</option>
-        </select>
-              </div>
-              
-              <div class="dc-form-group" id="dc-model-selection" style="display: none;">
-                <label class="dc-form-label">Model Version</label>
-                <select id="dc-ai-model" class="dc-form-input">
-                  <option value="">Select Model</option>
-                </select>
-              </div>
-              
-              <div class="dc-form-group">
-                <label class="dc-form-label">API Key</label>
-                <div style="position: relative;">
-                  <input 
-                    type="password" 
-                    id="dc-ai-key" 
-                    class="dc-form-input" 
-                    placeholder="Enter your API key"
-                    value="${this.ai.apiKey || ''}"
-                    style="padding-right: 2.5rem;"
-                  >
-                  <button type="button" class="dc-toggle-password" id="dc-toggle-ai-key" style="position: absolute; right: 0.5rem; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; padding: 0.25rem; display: flex; align-items: center; justify-content: center; color: #6B7280; transition: color 0.2s;" title="Show/Hide API Key">
-                    <svg id="dc-eye-icon-ai-key" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
-                      <circle cx="12" cy="12" r="3"></circle>
-                    </svg>
-                    <svg id="dc-eye-off-icon-ai-key" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;">
-                      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
-                      <line x1="1" y1="1" x2="23" y2="23"></line>
-                    </svg>
-                  </button>
-                </div>
-              </div>
-              
-              <div class="dc-info-box" style="background: #F0F9FF; border: 1px solid #BAE6FD; border-radius: 8px; padding: 0.75rem; margin-top: 0.75rem; font-size: 11px; line-height: 1.4;">
-                <div style="display: flex; align-items: center; margin-bottom: 0.25rem;">
-                  <span style="font-size: 12px; margin-right: 0.25rem;">💡</span>
-                  <strong style="font-size: 12px; color: #0369A1;">Get API Keys:</strong>
-                </div>
-                <div style="color: #0369A1; margin-left: 1rem;">
-                  • <a href="https://platform.openai.com/api-keys" target="_blank" style="color: #0369A1; text-decoration: none;">OpenAI</a> - GPT-5, GPT-4, GPT-4-turbo<br>
-                  • <a href="https://console.anthropic.com/settings/keys" target="_blank" style="color: #0369A1; text-decoration: none;">Anthropic</a> - Claude 4.5, 4.0, 3.5 Sonnet<br>
-                  • <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color: #0369A1; text-decoration: none;">Google AI Studio</a> - Gemini 2.0 Flash, 1.5 Flash
-                </div>
-              </div>
-              
-              <div class="dc-info-box" style="background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 8px; padding: 0.75rem; margin-top: 0.5rem; font-size: 11px; line-height: 1.4;">
-                <div style="display: flex; align-items: center; margin-bottom: 0.25rem;">
-                  <span style="font-size: 12px; margin-right: 0.25rem;">✨</span>
-                  <strong style="font-size: 12px; color: #166534;">AI Features:</strong>
-                </div>
-                <div style="color: #166534; margin-left: 1rem;">
-                  • Analyze chart data and trends<br>
-                  • Generate actionable insights<br>
-                  • Identify anomalies and patterns<br>
-                  • Provide recommendations
-                </div>
-              </div>
-              
-              <div id="dc-ai-loader" style="display: none; margin-top: 0.75rem; padding: 0.75rem; background: #F3F4F6; border-radius: 6px;">
-                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem;">
-                  <div style="display: flex; align-items: center; gap: 0.5rem;">
-                    <div class="dc-loading-spinner" style="width: 16px; height: 16px; border: 2px solid #E5E7EB; border-top: 2px solid #667eea; border-radius: 50%; animation: spin 0.8s linear infinite;"></div>
-                    <span style="font-size: 12px; color: #6B7280; font-weight: 500;">Testing connection...</span>
-                  </div>
-                  <button type="button" class="dc-copy-logs-btn" id="dc-copy-ai-logs-btn" style="display: none; background: white; border: 1px solid #E5E7EB; border-radius: 4px; padding: 0.25rem 0.5rem; cursor: pointer; font-size: 11px; color: #6B7280; transition: all 0.2s; display: flex; align-items: center; gap: 0.25rem;" title="Copy logs">
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                    </svg>
-                    <span class="dc-copy-logs-text">Copy</span>
-                  </button>
-                </div>
-                <div id="dc-ai-logs" style="font-size: 11px; color: #6B7280; line-height: 1.5; max-height: 120px; overflow-y: auto; font-family: 'Monaco', 'Courier New', monospace; background: white; padding: 0.5rem; border-radius: 4px; border: 1px solid #E5E7EB; white-space: pre-wrap; word-wrap: break-word; text-align: left; direction: ltr;"></div>
-              </div>
-              <p id="dc-ai-error" style="color: #EF4444; font-size: 11px; margin-top: 0.75rem; display: none;"></p>
-              <p id="dc-ai-success" style="color: #10B981; font-size: 11px; margin-top: 0.75rem; display: none;">✅ Connection successful!</p>
-            </div>
-            <div class="dc-dialog-footer" style="padding: 0.75rem 1.25rem 1rem; display: flex; gap: 0.5rem; border-top: 1px solid #F3F4F6;">
-              <button class="dc-btn dc-btn-secondary" id="dc-ai-close" style="flex: 1; padding: 0.5rem; font-size: 13px;">
-                Cancel
-              </button>
-              <button class="dc-btn dc-btn-primary" id="dc-ai-test" style="flex: 1; padding: 0.5rem; font-size: 13px;">
-                🔍 Test
-              </button>
-              <button class="dc-btn dc-btn-primary" id="dc-ai-save" style="flex: 1; padding: 0.5rem; font-size: 13px;" disabled>
-                Save
-              </button>
-            </div>
-          </div>
-        `;
-        
-        document.body.appendChild(dialog);
-        
-        // Password toggle handler for AI API key
-        const aiToggleBtn = dialog.querySelector('#dc-toggle-ai-key');
-        if (aiToggleBtn) {
-          aiToggleBtn.addEventListener('click', () => {
-            const keyInput = document.getElementById('dc-ai-key');
-            const eyeIcon = dialog.querySelector('#dc-eye-icon-ai-key');
-            const eyeOffIcon = dialog.querySelector('#dc-eye-off-icon-ai-key');
-            
-            if (keyInput && eyeIcon && eyeOffIcon) {
-              if (keyInput.type === 'password') {
-                keyInput.type = 'text';
-                eyeIcon.style.display = 'none';
-                eyeOffIcon.style.display = 'block';
-              } else {
-                keyInput.type = 'password';
-                eyeIcon.style.display = 'block';
-                eyeOffIcon.style.display = 'none';
-              }
-            }
-          });
-        }
-        
-        const providerSelect = document.getElementById('dc-ai-provider');
-        const modelSelect = document.getElementById('dc-ai-model');
-        const modelSelection = document.getElementById('dc-model-selection');
-        const keyInput = document.getElementById('dc-ai-key');
-        const errorMsg = document.getElementById('dc-ai-error');
-        const successMsg = document.getElementById('dc-ai-success');
-        const closeBtn = document.getElementById('dc-ai-close');
-        const testBtn = document.getElementById('dc-ai-test');
-        const saveBtn = document.getElementById('dc-ai-save');
-        
-        let connectionValid = false;
-        
-        // Model options for each provider
-        const modelOptions = {
-          'openai': [
-            { value: 'gpt-5', text: 'GPT-5 (Latest)' },
-            { value: 'gpt-4', text: 'GPT-4' },
-            { value: 'gpt-4-turbo', text: 'GPT-4 Turbo' }
-          ],
-          'anthropic': [
-            { value: 'claude-4-5-sonnet-20241022', text: 'Claude 4.5 Sonnet (Latest)' },
-            { value: 'claude-3-5-sonnet-20241022', text: 'Claude 3.5 Sonnet' },
-            { value: 'claude-3-5-haiku-20241022', text: 'Claude 3.5 Haiku' }
-          ],
-          'gemini': [
-            { value: 'gemini-2.0-flash', text: 'Gemini 2.0 Flash (Latest)' },
-            { value: 'gemini-1.5-flash', text: 'Gemini 1.5 Flash' }
-          ]
-        };
-
-        // Simple function to ensure select displays its value
-        const updateSelectDisplay = (selectElement) => {
-          if (!selectElement) return;
-          
-          const value = selectElement.value;
-          if (value) {
-            // Find and set the correct option as selected
-            const optionIndex = Array.from(selectElement.options).findIndex(opt => opt.value === value);
-            if (optionIndex >= 0) {
-              selectElement.selectedIndex = optionIndex;
-              // Ensure the option is marked as selected
-              selectElement.options[optionIndex].selected = true;
-            }
-            // Force style update - use darker color for visibility
-            selectElement.style.color = '#1F2937';
-            selectElement.style.fontWeight = '500';
-            // Force browser reflow
-            void selectElement.offsetWidth;
-          } else {
-            selectElement.style.color = '#9CA3AF';
-            selectElement.style.fontWeight = '400';
-          }
-        };
-        
-        // Handle provider selection
-        providerSelect.addEventListener('change', (e) => {
-          const selectedProvider = providerSelect.value;
-          
-          // Force the display to update immediately
-          if (selectedProvider) {
-            providerSelect.selectedIndex = Array.from(providerSelect.options).findIndex(opt => opt.value === selectedProvider);
-            providerSelect.style.color = '#1F2937';
-            providerSelect.style.fontWeight = '500';
-          }
-          
-          // Clear and reset model select
-          modelSelect.innerHTML = '<option value="">Select Model</option>';
-          modelSelect.value = '';
-          modelSelect.style.color = '#9CA3AF';
-          
-          if (selectedProvider && modelOptions[selectedProvider]) {
-            modelSelection.style.display = 'block';
-            modelOptions[selectedProvider].forEach(model => {
-              const option = document.createElement('option');
-              option.value = model.value;
-              option.textContent = model.text;
-              modelSelect.appendChild(option);
-            });
-          } else {
-            modelSelection.style.display = 'none';
-          }
-        });
-        
-        // Ensure selected values are visible when model dropdown changes
-        modelSelect.addEventListener('change', (e) => {
-          const selectedModel = modelSelect.value;
-          if (selectedModel) {
-            modelSelect.selectedIndex = Array.from(modelSelect.options).findIndex(opt => opt.value === selectedModel);
-            modelSelect.style.color = '#1F2937';
-            modelSelect.style.fontWeight = '500';
-          }
-        });
-        
-        // Initialize display for selects - ensure values are visible
-        const initSelects = () => {
-          if (providerSelect && providerSelect.value) {
-            updateSelectDisplay(providerSelect);
-          }
-          if (modelSelect && modelSelect.value) {
-            updateSelectDisplay(modelSelect);
-          }
-        };
-        
-        // Call immediately and after a short delay
-        initSelects();
-        setTimeout(initSelects, 50);
-        setTimeout(initSelects, 100);
-
-        // Initialize with current provider if configured
-        if (this.ai.isConfigured) {
-          connectionValid = true;
-          saveBtn.disabled = false;
-          if (this.ai.provider && modelOptions[this.ai.provider]) {
-            // Set provider select value and force display
-            providerSelect.value = this.ai.provider;
-            const providerIndex = Array.from(providerSelect.options).findIndex(opt => opt.value === this.ai.provider);
-            if (providerIndex >= 0) {
-              providerSelect.selectedIndex = providerIndex;
-              providerSelect.style.color = '#1F2937';
-              providerSelect.style.fontWeight = '500';
-            }
-            
-            modelSelection.style.display = 'block';
-            modelOptions[this.ai.provider].forEach(model => {
-              const option = document.createElement('option');
-              option.value = model.value;
-              option.textContent = model.text;
-              modelSelect.appendChild(option);
-            });
-            
-            // Set model select value and force display
-            if (this.ai.model) {
-              modelSelect.value = this.ai.model;
-              const modelIndex = Array.from(modelSelect.options).findIndex(opt => opt.value === this.ai.model);
-              if (modelIndex >= 0) {
-                modelSelect.selectedIndex = modelIndex;
-                modelSelect.style.color = '#1F2937';
-                modelSelect.style.fontWeight = '500';
-              }
-            }
-          }
-        }
-        
-        closeBtn.addEventListener('click', () => {
-          dialog.remove();
-          resolve();
-        });
-        
-        testBtn.addEventListener('click', async () => {
-          const provider = providerSelect.value;
-          const model = modelSelect.value;
-          const key = keyInput.value.trim();
-          
-          if (!provider || !model || !key) {
-            errorMsg.textContent = 'Please select provider, model, and enter API key';
-            errorMsg.style.display = 'block';
-            successMsg.style.display = 'none';
-            return;
-          }
-          
-          const loader = document.getElementById('dc-ai-loader');
-          const logs = document.getElementById('dc-ai-logs');
-          const copyBtn = document.getElementById('dc-copy-ai-logs-btn');
-          
-          // Reset UI
-          testBtn.textContent = '⏳ Testing...';
-          testBtn.disabled = true;
-          testBtn.style.background = '';
-          errorMsg.style.display = 'none';
-          successMsg.style.display = 'none';
-          loader.style.display = 'block';
-          logs.textContent = '';
-          
-          if (copyBtn) {
-            copyBtn.style.display = 'none';
-          }
-          
-          // Add log helper
-          const addLog = (message, type = 'info') => {
-            const timestamp = new Date().toLocaleTimeString();
-            const prefix = type === 'error' ? '❌' : type === 'success' ? '✅' : '🔍';
-            const logLine = `[${timestamp}] ${prefix} ${message}`;
-            
-            // Append to textContent for easy copying
-            if (logs.textContent) {
-              logs.textContent += '\n' + logLine;
-            } else {
-              logs.textContent = logLine;
-            }
-            
-            logs.scrollTop = logs.scrollHeight;
-            console.log(`[AI-TEST] ${message}`);
-            
-            // Show copy button when logs are present
-            if (copyBtn && logs.textContent.trim()) {
-              copyBtn.style.display = 'flex';
-            }
-          };
-          
-          // Copy button functionality
-          if (copyBtn) {
-            copyBtn.onclick = async () => {
-              try {
-                const logText = logs.textContent || '';
-                if (!logText.trim()) {
-                  return;
-                }
-                
-                await navigator.clipboard.writeText(logText);
-                
-                // Visual feedback
-                const originalText = copyBtn.querySelector('.dc-copy-logs-text').textContent;
-                copyBtn.querySelector('.dc-copy-logs-text').textContent = 'Copied!';
-                copyBtn.style.background = '#10B981';
-                copyBtn.style.borderColor = '#10B981';
-                copyBtn.style.color = 'white';
-                
-                setTimeout(() => {
-                  copyBtn.querySelector('.dc-copy-logs-text').textContent = originalText;
-                  copyBtn.style.background = 'white';
-                  copyBtn.style.borderColor = '#E5E7EB';
-                  copyBtn.style.color = '#6B7280';
-                }, 2000);
-              } catch (err) {
-                console.error('Failed to copy logs:', err);
-              }
-            };
-          }
-          
-          addLog(`Starting ${provider.toUpperCase()} connection test...`);
-          addLog(`Provider: ${provider}`);
-          addLog(`Model: ${model}`);
-          addLog(`API Key: ${key.substring(0, 10)}...`);
-          
-          // Temporarily set for testing
-          this.ai.provider = provider;
-          this.ai.model = model;
-          this.ai.apiKey = key;
-          
-          try {
-            const isValid = await this.ai.testConnection(addLog);
-            
-            if (isValid) {
-              const modelText = modelOptions[provider].find(m => m.value === model)?.text || model;
-              addLog(`Connection successful!`, 'success');
-              loader.style.display = 'none'; // Stop loader on success
-              successMsg.textContent = `✅ ${provider.charAt(0).toUpperCase() + provider.slice(1)} (${modelText}) connected successfully!`;
-              successMsg.style.display = 'block';
-              errorMsg.style.display = 'none';
-              connectionValid = true;
-              saveBtn.disabled = false;
-              testBtn.textContent = '✅ Connected';
-              testBtn.style.background = '#10B981';
-              testBtn.disabled = false;
-            } else {
-              addLog(`Connection failed. Check your API key.`, 'error');
-              loader.style.display = 'none'; // Stop loader on failure
-              errorMsg.textContent = '❌ Connection failed. Check your API key.';
-              errorMsg.style.display = 'block';
-              successMsg.style.display = 'none';
-              connectionValid = false;
-              saveBtn.disabled = true;
-              testBtn.textContent = '🔍 Test';
-              testBtn.style.background = '';
-              testBtn.disabled = false;
-            }
-          } catch (error) {
-            addLog(`Error: ${error.message}`, 'error');
-            loader.style.display = 'none'; // Stop loader on error
-            errorMsg.textContent = `❌ Error: ${error.message}`;
-            errorMsg.style.display = 'block';
-            successMsg.style.display = 'none';
-            connectionValid = false;
-            saveBtn.disabled = true;
-            testBtn.textContent = '🔍 Test';
-            testBtn.style.background = '';
-            testBtn.disabled = false;
-          }
-        });
-        
-        saveBtn.addEventListener('click', async () => {
-          if (!connectionValid) {
-            errorMsg.textContent = 'Please test connection first';
-            errorMsg.style.display = 'block';
-            return;
-          }
-          
-          const provider = providerSelect.value;
-          const model = modelSelect.value;
-          const key = keyInput.value.trim();
-          
-          await chrome.storage.sync.set({ 
-            aiProvider: provider,
-            aiModel: model,
-            aiApiKey: key
-          });
-          
-          this.ai.provider = provider;
-          this.ai.model = model;
-          this.ai.apiKey = key;
-          this.ai.isConfigured = true;
-          
-          this.showToast('✅ AI configuration saved!');
-          dialog.remove();
-          resolve();
-        });
-        
-        [providerSelect, modelSelect, keyInput].forEach(input => {
-          input.addEventListener('input', () => {
-            errorMsg.style.display = 'none';
-            successMsg.style.display = 'none';
-            connectionValid = false;
-            saveBtn.disabled = true;
-            testBtn.textContent = '🔍 Test';
-            testBtn.disabled = false;
-            testBtn.style.background = '';
-          });
-        });
-      });
-    }
-  
     // Generate unique page identifier
     generatePageId() {
       const url = new URL(window.location.href);
@@ -2393,7 +912,11 @@ db.comments.createIndex({ "timestamp": -1 });
     }
   
     // Inject sidebar
-    injectSidebar() {
+    async injectSidebar() {
+      // Read before building the DOM so a collapsed sidebar never slides in and back out.
+      const stored = await this.safeChromeStorage(() => chrome.storage.local.get('sidebarCollapsed'));
+      const isCollapsed = stored ? stored.sidebarCollapsed === true : false;
+
       const sidebar = document.createElement('div');
       sidebar.id = 'stickr-sidebar';
       sidebar.className = 'dc-sidebar open';
@@ -2461,7 +984,7 @@ db.comments.createIndex({ "timestamp": -1 });
         </div>
       `;
       
-      document.body.appendChild(sidebar);
+      this.uiAppend(sidebar);
       this.sidebar = sidebar;
       
       // Assert visibility immediately after injection
@@ -2473,7 +996,7 @@ db.comments.createIndex({ "timestamp": -1 });
       this.expandButton.className = 'dc-expand-button';
       this.expandButton.innerHTML = `<img src="${chrome.runtime.getURL('/icons/cognito-16.png')}" alt="Expand" class="dc-toggle-icon dc-toggle-icon-flipped">`;
       this.expandButton.title = 'Expand Sidebar';
-      document.body.appendChild(this.expandButton);
+      this.uiAppend(this.expandButton);
       
       // Toggle button
       sidebar.querySelector('.dc-toggle-btn').addEventListener('click', () => {
@@ -2486,33 +1009,34 @@ db.comments.createIndex({ "timestamp": -1 });
       });
       
       // Add bubble comment button
-      document.getElementById('dc-add-bubble').addEventListener('click', () => {
+      this.uiById('dc-add-bubble').addEventListener('click', () => {
         this.startAddingBubbleComment();
       });
       
       // Add quick note button
-      document.getElementById('dc-add-quick-note').addEventListener('click', () => {
+      this.uiById('dc-add-quick-note').addEventListener('click', () => {
         this.addQuickNote();
       });
       
       // Toggle bubbles visibility switch
-      document.getElementById('dc-toggle-bubbles').addEventListener('change', (e) => {
+      this.uiById('dc-toggle-bubbles').addEventListener('change', (e) => {
         this.bubblesHidden = !e.target.checked;
         this.toggleBubblesVisibility();
       });
       
       // Clear all notes button
-      document.getElementById('dc-clear-all').addEventListener('click', () => {
+      this.uiById('dc-clear-all').addEventListener('click', () => {
         this.clearAllNotes();
       });
       
-      // Config menu button
-      document.getElementById('dc-config-menu').addEventListener('click', () => {
-        this.showConfigMenu();
+      // Settings button: opens the extension's own settings page rather than an
+      // in-page dialog, so credentials never touch the host page's DOM.
+      this.uiById('dc-config-menu').addEventListener('click', () => {
+        this.openSettings();
       });
       
       // Filter dropdown
-      document.getElementById('dc-comment-filter').addEventListener('change', (e) => {
+      this.uiById('dc-comment-filter').addEventListener('change', (e) => {
         this.currentFilter = e.target.value;
         this.renderComments();
       });
@@ -2521,14 +1045,13 @@ db.comments.createIndex({ "timestamp": -1 });
       this.currentFilter = 'all';
       
       // Handle Enter key in textarea
-      document.getElementById('dc-quick-note').addEventListener('keydown', (e) => {
+      this.uiById('dc-quick-note').addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && e.ctrlKey) {
           this.addQuickNote();
         }
       });
       
       // Restore sidebar state
-      const isCollapsed = localStorage.getItem('stickr-sidebar-collapsed') === 'true';
       if (isCollapsed) {
         this.sidebar.classList.add('dc-collapsed');
         this.sidebar.classList.remove('open');
@@ -2550,21 +1073,21 @@ db.comments.createIndex({ "timestamp": -1 });
         // Hide expand button
         if (this.expandButton) this.expandButton.style.display = 'none';
         // Store state
-        localStorage.setItem('stickr-sidebar-collapsed', 'false');
+        this.safeChromeStorage(() => chrome.storage.local.set({ sidebarCollapsed: false }));
       } else {
         this.sidebar.classList.add('dc-collapsed');
         this.sidebar.classList.remove('open');
         // Show expand button
         if (this.expandButton) this.expandButton.style.display = 'flex';
         // Store state
-        localStorage.setItem('stickr-sidebar-collapsed', 'true');
+        this.safeChromeStorage(() => chrome.storage.local.set({ sidebarCollapsed: true }));
       }
     }
     
     // Add quick note
     addQuickNote() {
-      const textarea = document.getElementById('dc-quick-note');
-      const typeSelect = document.getElementById('dc-note-type');
+      const textarea = this.uiById('dc-quick-note');
+      const typeSelect = this.uiById('dc-note-type');
       const text = textarea.value.trim();
       
       if (!text) {
@@ -2593,8 +1116,14 @@ db.comments.createIndex({ "timestamp": -1 });
   
     // Setup event listeners
     setupEventListeners() {
-      // Handle clicks when adding bubble comment
+      // Handle clicks when adding bubble comment.
+      // isTrusted gate: these listeners sit on the host page's document, which is the one
+      // surface a site can still reach by calling dispatchEvent. Nothing here should ever
+      // act on an event the browser did not generate from real user input, and the
+      // extension never dispatches synthetic events of its own.
       document.addEventListener('click', (e) => {
+        if (!e.isTrusted) return;
+
         if (this.isAddingComment) {
           e.preventDefault();
           e.stopPropagation();
@@ -2604,11 +1133,13 @@ db.comments.createIndex({ "timestamp": -1 });
       
       // Global click listener to close bubbles when clicking outside
       document.addEventListener('click', (e) => {
+        if (!e.isTrusted) return;
+
         // Check if click is outside all bubbles
-        const clickedBubble = e.target.closest('.dc-bubble-pin');
+        const clickedBubble = this.uiElementFromEvent(e, '.dc-bubble-pin');
         if (!clickedBubble) {
           // Close all active bubbles
-          document.querySelectorAll('.dc-bubble-pin.active').forEach(bubble => {
+          this.uiQueryAll('.dc-bubble-pin.active').forEach(bubble => {
             bubble.classList.remove('active');
           });
         }
@@ -2617,10 +1148,19 @@ db.comments.createIndex({ "timestamp": -1 });
       // Listen for storage changes (multi-user sync)
       if (this.isExtensionContextValid()) {
         chrome.storage.onChanged.addListener((changes, namespace) => {
-          if (namespace === 'sync' && changes.comments) {
+          if (namespace !== 'sync') return;
+
+          if (changes.comments) {
             this.comments = changes.comments.newValue || [];
             this.renderComments();
             this.renderBubbles();
+          }
+
+          // Configuration is edited on the settings page now, in a different tab, so the
+          // integration objects held here no longer update as a side effect of the user
+          // saving. Anything in sync storage other than the notes themselves is config.
+          if (Object.keys(changes).some(key => key !== 'comments')) {
+            this.refreshIntegrations();
           }
         });
       }
@@ -2659,7 +1199,7 @@ db.comments.createIndex({ "timestamp": -1 });
             lastPanelCount = currentPanelCount;
             
             // Clear all bubbles immediately
-            document.querySelectorAll('.dc-bubble-pin').forEach(bubble => bubble.remove());
+            this.uiQueryAll('.dc-bubble-pin').forEach(bubble => bubble.remove());
             
             // Re-render for the new panels
             this.renderComments();
@@ -2680,7 +1220,7 @@ db.comments.createIndex({ "timestamp": -1 });
             this.currentPageId = newPageId;
             
             // Clear all bubbles immediately for clean transition
-            document.querySelectorAll('.dc-bubble-pin').forEach(bubble => bubble.remove());
+            this.uiQueryAll('.dc-bubble-pin').forEach(bubble => bubble.remove());
             
             // Re-render everything for the new page
             this.renderComments();
@@ -2706,7 +1246,7 @@ db.comments.createIndex({ "timestamp": -1 });
           this.currentPageId = newPageId;
           
           // Clear all bubbles immediately
-          document.querySelectorAll('.dc-bubble-pin').forEach(bubble => bubble.remove());
+          this.uiQueryAll('.dc-bubble-pin').forEach(bubble => bubble.remove());
           
           this.renderComments();
           setTimeout(() => {
@@ -2874,6 +1414,8 @@ db.comments.createIndex({ "timestamp": -1 });
       
       // Also watch for clicks on time picker button
       document.addEventListener('click', (e) => {
+        if (!e.isTrusted) return;
+
         const timePickerButton = e.target.closest('[aria-label*="Time range"]') ||
                                  e.target.closest('[data-testid="data-testid Time range picker"]') ||
                                  e.target.closest('button[aria-controls*="TimePickerContent"]');
@@ -2897,10 +1439,12 @@ db.comments.createIndex({ "timestamp": -1 });
         ? '🎯 Click anywhere on the page to add a comment'
         : '🎯 Click on any chart to add a comment';
       overlay.innerHTML = `<div class="dc-overlay-text">${instructionText}<br><small style="opacity: 0.7;">Press ESC to cancel</small></div>`;
-      document.body.appendChild(overlay);
+      this.uiAppend(overlay);
       
       // Cancel on Escape
       const cancelHandler = (e) => {
+        if (!e.isTrusted) return;
+
         if (e.key === 'Escape') {
           this.cancelAddingComment();
           document.removeEventListener('keydown', cancelHandler);
@@ -2912,7 +1456,7 @@ db.comments.createIndex({ "timestamp": -1 });
     cancelAddingComment() {
       this.isAddingComment = false;
       document.body.style.cursor = 'default';
-      const overlay = document.querySelector('.dc-click-overlay');
+      const overlay = this.uiQuery('.dc-click-overlay');
       if (overlay) overlay.remove();
     }
   
@@ -2994,7 +1538,7 @@ db.comments.createIndex({ "timestamp": -1 });
         </div>
       `;
       
-      document.body.appendChild(dialog);
+      this.uiAppend(dialog);
       
       const textarea = dialog.querySelector('.dc-comment-input');
       const linkInput = dialog.querySelector('.dc-link-input');
@@ -3061,6 +1605,28 @@ db.comments.createIndex({ "timestamp": -1 });
       });
     }
   
+    // Re-read integration and profile config after the settings page changes it. The
+    // rendered comment actions depend on db/jira/ai being configured, so re-render too.
+    async refreshIntegrations() {
+      try {
+        await this.db.init();
+        await this.jira.init();
+        await this.ai.init();
+
+        const result = await this.safeChromeStorage(() => chrome.storage.sync.get(['userEmail', 'userRole']));
+        if (result && result.userEmail) {
+          this.userEmail = result.userEmail;
+          this.userRole = result.userRole || '';
+          this.username = result.userEmail.split('@')[0];
+        }
+      } catch (error) {
+        console.warn('Failed to refresh Cognito configuration:', error);
+      }
+
+      this.renderComments();
+      this.renderBubbles();
+    }
+
     // Show toast notification
     showToast(message, type = 'success', duration = 3000) {
       const toast = document.createElement('div');
@@ -3073,7 +1639,7 @@ db.comments.createIndex({ "timestamp": -1 });
         toast.style.background = '#F59E0B !important';
       }
       toast.textContent = message;
-      document.body.appendChild(toast);
+      this.uiAppend(toast);
       
       setTimeout(() => toast.classList.add('dc-toast-show'), 100);
       setTimeout(() => {
@@ -3121,7 +1687,7 @@ db.comments.createIndex({ "timestamp": -1 });
         </div>
       `;
       
-      document.body.appendChild(dialog);
+      this.uiAppend(dialog);
       
       const textarea = dialog.querySelector('.dc-textarea');
       const typeSelect = dialog.querySelector('#dc-reply-type');
@@ -3247,7 +1813,7 @@ db.comments.createIndex({ "timestamp": -1 });
   
     // Render comments in sidebar
     renderComments() {
-      const container = document.getElementById('dc-comments-list');
+      const container = this.uiById('dc-comments-list');
       if (!container) return;
       
       // Filter comments by current page and filter type
@@ -3305,7 +1871,7 @@ db.comments.createIndex({ "timestamp": -1 });
         }
         
         return `
-          <div class="${cardClass}" data-comment-id="${comment.id}" style="margin-left: ${indent}px; position: relative;">
+          <div class="${cardClass}" data-comment-handle="${this.commentHandle(comment.id)}" style="margin-left: ${indent}px; position: relative;">
             <div class="dc-comment-content">
           <div class="dc-comment-header">
                 <span class="dc-comment-type">${typeEmojis[comment.commentType] || '💬'} ${comment.commentType || 'comment'}</span>
@@ -3321,10 +1887,10 @@ db.comments.createIndex({ "timestamp": -1 });
               </div>
             </div>
             <div class="dc-comment-actions">
-              <button class="dc-btn-icon dc-reply" data-id="${comment.id}" title="Reply">💬</button>
-              ${this.jira.isConfigured && !comment.jiraTicket ? `<button class="dc-btn-icon dc-create-jira" data-id="${comment.id}" title="Create Jira Ticket"><img src="${chrome.runtime.getURL('icons/atlassian.png')}" alt="Jira" style="width: 16px; height: 16px;"></button>` : ''}
-              ${this.ai.isConfigured && isBubble ? `<button class="dc-btn-icon dc-ai-analyze" data-id="${comment.id}" title="AI Analyze Chart">${this.getAIProviderIcon()}</button>` : ''}
-            <button class="dc-btn-icon dc-delete" data-id="${comment.id}" title="Delete">🗑️</button>
+              <button class="dc-btn-icon dc-reply" data-handle="${this.commentHandle(comment.id)}" title="Reply">💬</button>
+              ${this.jira.isConfigured && !comment.jiraTicket ? `<button class="dc-btn-icon dc-create-jira" data-handle="${this.commentHandle(comment.id)}" title="Create Jira Ticket"><img src="${chrome.runtime.getURL('icons/atlassian.png')}" alt="Jira" style="width: 16px; height: 16px;"></button>` : ''}
+              ${this.ai.isConfigured && isBubble ? `<button class="dc-btn-icon dc-ai-analyze" data-handle="${this.commentHandle(comment.id)}" title="AI Analyze Chart">${this.getAIProviderIcon()}</button>` : ''}
+            <button class="dc-btn-icon dc-delete" data-handle="${this.commentHandle(comment.id)}" title="Delete">🗑️</button>
           </div>
         </div>
           ${replies.map(reply => renderComment(reply, level + 1)).join('')}
@@ -3341,7 +1907,8 @@ db.comments.createIndex({ "timestamp": -1 });
         btn.addEventListener('click', (e) => {
           e.preventDefault();
           e.stopPropagation();
-          const id = e.currentTarget.getAttribute('data-id');
+          const id = this.commentIdFromHandle(e.currentTarget.getAttribute('data-handle'));
+          if (!id) return;
           this.showReplyDialog(id);
         });
       });
@@ -3351,7 +1918,8 @@ db.comments.createIndex({ "timestamp": -1 });
         btn.addEventListener('click', (e) => {
           e.preventDefault();
           e.stopPropagation();
-          const id = e.currentTarget.getAttribute('data-id');
+          const id = this.commentIdFromHandle(e.currentTarget.getAttribute('data-handle'));
+          if (!id) return;
           this.deleteComment(id);
         });
       });
@@ -3361,7 +1929,8 @@ db.comments.createIndex({ "timestamp": -1 });
         btn.addEventListener('click', (e) => {
           e.preventDefault();
           e.stopPropagation();
-          const id = e.currentTarget.getAttribute('data-id');
+          const id = this.commentIdFromHandle(e.currentTarget.getAttribute('data-handle'));
+          if (!id) return;
           this.showJiraTicketDialog(id);
         });
       });
@@ -3371,7 +1940,8 @@ db.comments.createIndex({ "timestamp": -1 });
         btn.addEventListener('click', (e) => {
           e.preventDefault();
           e.stopPropagation();
-          const id = e.currentTarget.getAttribute('data-id');
+          const id = this.commentIdFromHandle(e.currentTarget.getAttribute('data-handle'));
+          if (!id) return;
           this.analyzeCommentWithAI(id);
         });
       });
@@ -3612,7 +2182,7 @@ db.comments.createIndex({ "timestamp": -1 });
         const replies = this.comments.filter(c => c.parentId === comment.id);
         
         const commentHTML = `
-          <div class="dc-bubble-comment-item" data-comment-id="${comment.id}" style="margin-left: ${indent}px;">
+          <div class="dc-bubble-comment-item" data-comment-handle="${this.commentHandle(comment.id)}" style="margin-left: ${indent}px;">
             <div class="dc-bubble-comment-content">
               <div class="dc-bubble-comment-header">
                 <span class="dc-bubble-comment-type">${typeEmojis[comment.commentType] || '💬'} ${comment.commentType}</span>
@@ -3685,7 +2255,7 @@ db.comments.createIndex({ "timestamp": -1 });
         // Toggle bubble
         e.stopPropagation();
         console.log('🔄 Bubble clicked, toggling...');
-        document.querySelectorAll('.dc-bubble-pin.active').forEach(bubble => {
+        this.uiQueryAll('.dc-bubble-pin.active').forEach(bubble => {
           if (bubble !== newPin) bubble.classList.remove('active');
         });
         newPin.classList.toggle('active');
@@ -3726,7 +2296,7 @@ db.comments.createIndex({ "timestamp": -1 });
         const replies = this.comments.filter(c => c.parentId === comment.id);
         
         const commentHTML = `
-          <div class="dc-bubble-comment-item" data-comment-id="${comment.id}" style="margin-left: ${indent}px;">
+          <div class="dc-bubble-comment-item" data-comment-handle="${this.commentHandle(comment.id)}" style="margin-left: ${indent}px;">
             <div class="dc-bubble-comment-content">
               <div class="dc-bubble-comment-header">
                 <span class="dc-bubble-comment-type">${typeEmojis[comment.commentType] || '💬'} ${comment.commentType}</span>
@@ -3770,7 +2340,7 @@ db.comments.createIndex({ "timestamp": -1 });
       // Initially position it (will be updated by positionBubble)
       this.positionBubble(pin, chart);
       
-      document.body.appendChild(pin);
+      this.uiAppend(pin);
       
       // Store bubble reference in Map (keyed by chartHash, not element)
       this.bubbleMap.set(chartHash, {
@@ -3857,12 +2427,12 @@ db.comments.createIndex({ "timestamp": -1 });
       pin.style.left = `${x}px`;
       pin.style.top = `${y}px`;
       
-      document.body.appendChild(pin);
+      this.uiAppend(pin);
       
       // Click to toggle bubble content
       pin.addEventListener('click', (e) => {
         // Close all other active bubbles
-        document.querySelectorAll('.dc-bubble-pin.active').forEach(bubble => {
+        this.uiQueryAll('.dc-bubble-pin.active').forEach(bubble => {
           if (bubble !== pin) bubble.classList.remove('active');
         });
         
@@ -3881,9 +2451,13 @@ db.comments.createIndex({ "timestamp": -1 });
       }
       
       
-      // Close bubble when clicking outside
+      // Close bubble when clicking outside. Uses the composed path because the pin now
+      // lives in the shadow root, so e.target is the host by the time this runs.
       document.addEventListener('click', (e) => {
-        if (!pin.contains(e.target)) {
+        if (!e.isTrusted) return;
+
+        const path = typeof e.composedPath === 'function' ? e.composedPath() : [e.target];
+        if (!path.includes(pin)) {
           pin.classList.remove('active');
         }
       });
@@ -3941,111 +2515,6 @@ db.comments.createIndex({ "timestamp": -1 });
       }
     }
     
-    // Show configuration menu
-    async showConfigMenu() {
-      if (!this.isExtensionContextValid()) {
-        console.warn('Extension context invalidated, cannot show config menu');
-        return;
-      }
-      
-      const result = await this.safeChromeStorage(() => chrome.storage.sync.get(['dbProvider', 'aiProvider']));
-      const dbProvider = result ? (result.dbProvider || 'none') : 'none';
-      const aiProvider = result ? (result.aiProvider || 'none') : 'none';
-      let dbStatusText = 'Configure team collaboration database';
-      let aiStatusText = 'Configure AI provider for chart analysis';
-      
-      if (dbProvider === 'local') {
-        dbStatusText = 'Currently using local storage (solo mode)';
-      } else if (dbProvider === 'supabase') {
-        dbStatusText = 'Currently using Supabase';
-      } else if (dbProvider === 'mongodb') {
-        dbStatusText = 'Currently using MongoDB';
-      }
-      
-      if (aiProvider === 'openai') {
-        const modelName = this.ai.model || 'GPT-5';
-        aiStatusText = `Currently using OpenAI (${modelName})`;
-      } else if (aiProvider === 'anthropic') {
-        const modelName = this.ai.model || 'Claude 4.5 Sonnet';
-        aiStatusText = `Currently using Anthropic (${modelName})`;
-      } else if (aiProvider === 'gemini') {
-        const modelName = this.ai.model || 'Gemini Pro';
-        aiStatusText = `Currently using Google Gemini (${modelName})`;
-      }
-      
-      const menu = document.createElement('div');
-      menu.className = 'dc-config-menu-overlay';
-      menu.innerHTML = `
-        <div class="dc-config-menu">
-          <div class="dc-config-menu-header">
-            <h3>⚙️ Settings & Integrations</h3>
-            <button class="dc-config-close" id="dc-config-close">×</button>
-          </div>
-          <div class="dc-config-menu-body">
-            <button class="dc-config-menu-item" id="dc-menu-database">
-              <div class="dc-config-menu-icon">🗄️</div>
-              <div class="dc-config-menu-text">
-                <div class="dc-config-menu-title">Database Configuration</div>
-                <div class="dc-config-menu-desc">${dbStatusText}</div>
-              </div>
-              <div class="dc-config-menu-status">${this.db.isConfigured ? '✅' : (dbProvider === 'local' ? '💾' : '⚙️')}</div>
-            </button>
-            
-            <button class="dc-config-menu-item" id="dc-menu-jira">
-              <div class="dc-config-menu-icon">
-                <img src="${chrome.runtime.getURL('icons/atlassian.png')}" alt="Atlassian" style="width: 24px; height: 24px;">
-              </div>
-              <div class="dc-config-menu-text">
-                <div class="dc-config-menu-title">Atlassian Integration</div>
-                <div class="dc-config-menu-desc">Connect to Jira for ticket management</div>
-              </div>
-              <div class="dc-config-menu-status">${this.jira.isConfigured ? '✅' : '⚙️'}</div>
-            </button>
-            
-            <button class="dc-config-menu-item" id="dc-menu-ai">
-              <div class="dc-config-menu-icon">🤖</div>
-              <div class="dc-config-menu-text">
-                <div class="dc-config-menu-title">AI Configuration</div>
-                <div class="dc-config-menu-desc">${aiStatusText}</div>
-              </div>
-              <div class="dc-config-menu-status">${this.ai.isConfigured ? '✅' : '⚙️'}</div>
-            </button>
-          </div>
-        </div>
-      `;
-      
-      document.body.appendChild(menu);
-      
-      // Close button
-      document.getElementById('dc-config-close').addEventListener('click', () => {
-        menu.remove();
-      });
-      
-      // Click outside to close
-      menu.addEventListener('click', (e) => {
-        if (e.target === menu) {
-          menu.remove();
-        }
-      });
-      
-      // Database config
-      document.getElementById('dc-menu-database').addEventListener('click', () => {
-        menu.remove();
-        this.showDatabaseDialog();
-      });
-      
-      // Jira config
-      document.getElementById('dc-menu-jira').addEventListener('click', () => {
-        menu.remove();
-        this.showJiraConfigDialog();
-      });
-      
-      // AI config
-      document.getElementById('dc-menu-ai').addEventListener('click', () => {
-        menu.remove();
-        this.showAIConfigDialog();
-      });
-    }
     
     // Clear all notes (for debugging/cleanup)
     async clearAllNotes() {
@@ -4251,7 +2720,7 @@ ${comment.link ? `\nReference: ${this.escapeHtml(comment.link)}` : ''}</textarea
         </div>
       `;
       
-      document.body.appendChild(dialog);
+      this.uiAppend(dialog);
       
       // Load projects for both dropdowns
       this.loadJiraProjects(dialog);
@@ -4273,7 +2742,7 @@ ${comment.link ? `\nReference: ${this.escapeHtml(comment.link)}` : ''}</textarea
           dialog.querySelector(`#${tab}-tab`).classList.add('active');
           
           // Update button text
-          const createBtn = document.getElementById('dc-jira-create');
+          const createBtn = this.uiById('dc-jira-create');
           if (tab === 'create') {
             createBtn.innerHTML = `Create Ticket`;
           } else {
@@ -4283,20 +2752,20 @@ ${comment.link ? `\nReference: ${this.escapeHtml(comment.link)}` : ''}</textarea
       });
       
       // Form elements
-      const summaryInput = document.getElementById('dc-jira-summary');
-      const descriptionInput = document.getElementById('dc-jira-description');
-      const projectSelect = document.getElementById('dc-jira-project');
-      const typeSelect = document.getElementById('dc-jira-type');
-      const searchInput = document.getElementById('dc-jira-search');
-      const searchBtn = document.getElementById('dc-jira-search-btn');
-      const filterProjectSelect = document.getElementById('dc-jira-filter-project');
-      const ticketsList = document.getElementById('dc-jira-tickets-list');
-      const errorMsg = document.getElementById('dc-jira-create-error');
-      const successMsg = document.getElementById('dc-jira-create-success');
-      const attachErrorMsg = document.getElementById('dc-jira-attach-error');
-      const attachSuccessMsg = document.getElementById('dc-jira-attach-success');
-      const createBtn = document.getElementById('dc-jira-create');
-      const cancelBtn = document.getElementById('dc-jira-cancel');
+      const summaryInput = this.uiById('dc-jira-summary');
+      const descriptionInput = this.uiById('dc-jira-description');
+      const projectSelect = this.uiById('dc-jira-project');
+      const typeSelect = this.uiById('dc-jira-type');
+      const searchInput = this.uiById('dc-jira-search');
+      const searchBtn = this.uiById('dc-jira-search-btn');
+      const filterProjectSelect = this.uiById('dc-jira-filter-project');
+      const ticketsList = this.uiById('dc-jira-tickets-list');
+      const errorMsg = this.uiById('dc-jira-create-error');
+      const successMsg = this.uiById('dc-jira-create-success');
+      const attachErrorMsg = this.uiById('dc-jira-attach-error');
+      const attachSuccessMsg = this.uiById('dc-jira-attach-success');
+      const createBtn = this.uiById('dc-jira-create');
+      const cancelBtn = this.uiById('dc-jira-cancel');
       
       summaryInput.focus();
       
@@ -4505,7 +2974,7 @@ ${comment.link ? `\nReference: ${this.escapeHtml(comment.link)}` : ''}</textarea
           errorMsg.style.display = 'none';
           
           setTimeout(() => {
-            document.querySelector('.dc-dialog-overlay').remove();
+            this.uiQuery('.dc-dialog-overlay').remove();
             this.renderComments();
           }, 1500);
         } else {
@@ -4568,7 +3037,7 @@ ${comment.link ? `\nReference: ${this.escapeHtml(comment.link)}` : ''}</textarea
         errorMsg.style.display = 'none';
         
         setTimeout(() => {
-          document.querySelector('.dc-dialog-overlay').remove();
+          this.uiQuery('.dc-dialog-overlay').remove();
           this.renderComments();
         }, 1500);
       } catch (error) {
@@ -4641,7 +3110,7 @@ ${comment.link ? `\nReference: ${this.escapeHtml(comment.link)}` : ''}</textarea
           </div>
         </div>
       `;
-      document.body.appendChild(loadingDialog);
+      this.uiAppend(loadingDialog);
       
       try {
         // Check if html2canvas is available (bundled with extension)
@@ -4704,13 +3173,13 @@ Provide a clear, concise analysis.${userRoleContext}`);
           </div>
         `;
         
-        document.body.appendChild(resultsDialog);
+        this.uiAppend(resultsDialog);
         
-        document.getElementById('dc-ai-close').addEventListener('click', () => {
+        this.uiById('dc-ai-close').addEventListener('click', () => {
           resultsDialog.remove();
         });
         
-        document.getElementById('dc-ai-save-note').addEventListener('click', () => {
+        this.uiById('dc-ai-save-note').addEventListener('click', () => {
           // Create a new note with AI analysis
           const note = {
             id: Date.now().toString(),
@@ -4752,14 +3221,14 @@ Provide a clear, concise analysis.${userRoleContext}`);
             </div>
           </div>
         `;
-        document.body.appendChild(errorDialog);
+        this.uiAppend(errorDialog);
       }
     }
 
     // Ensure UI visibility against host page CSS overrides
     ensureSidebarUIVisibility() {
       try {
-        const root = document.getElementById('stickr-sidebar');
+        const root = this.uiById('stickr-sidebar');
         if (!root) return;
         // Buttons
         root.querySelectorAll('.dc-btn-icon, .dc-comment-actions button').forEach(el => {
@@ -4783,18 +3252,32 @@ Provide a clear, concise analysis.${userRoleContext}`);
       }
     }
 
+    // Associate a stored targetId with the live element it annotates, for this page load
+    // only. Comments also carry a targetPath, which is what survives a reload, so nothing
+    // needs to be written into the page to re-find an annotated element on the next visit.
     ensureGenericTargetId(element, preferredId = null) {
-      if (!element || typeof element.getAttribute !== 'function') {
+      if (!element || element.nodeType !== 1) {
         return null;
       }
 
-      let existing = element.getAttribute(this.genericTargetAttribute);
+      let existing = this.genericTargetIdFor(element);
       if (!existing) {
         existing = preferredId || `cognito-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-        element.setAttribute(this.genericTargetAttribute, existing);
+        this.genericTargets.set(existing, element);
       }
 
       return existing;
+    }
+
+    // Reverse lookup over the session map: the id currently associated with an element.
+    genericTargetIdFor(element) {
+      for (const [targetId, target] of this.genericTargets.entries()) {
+        if (target === element) {
+          return targetId;
+        }
+      }
+
+      return null;
     }
 
     isInternalElement(element) {
@@ -4852,7 +3335,7 @@ Provide a clear, concise analysis.${userRoleContext}`);
             continue;
           }
 
-          if (candidate.hasAttribute && candidate.hasAttribute(this.genericTargetAttribute)) {
+          if (this.genericTargetIdFor(candidate)) {
             return candidate;
           }
 
@@ -4875,9 +3358,13 @@ Provide a clear, concise analysis.${userRoleContext}`);
       let element = null;
 
       if (targetId) {
-        element = document.querySelector(`[${this.genericTargetAttribute}="${targetId}"]`);
-        if (element) {
+        element = this.genericTargets.get(targetId);
+        if (element && element.isConnected) {
           return element;
+        }
+
+        if (element) {
+          this.genericTargets.delete(targetId);
         }
       }
 

@@ -3,7 +3,8 @@
 /* Ensure the font is available */
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
-:root {
+:root,
+:host {
   --stickr-font-family: 'Inter', sans-serif;
   --stickr-background: #F5F5F5;
   --stickr-foreground: #262626;
@@ -31,6 +32,22 @@
 
 body {
   font-family: var(--stickr-font-family);
+}
+
+/* Wrapper for everything the content script renders, inside the closed shadow root.
+   `all: initial` severs inheritance from the host page, which would otherwise push its
+   font, colour and text metrics into our UI (custom properties are exempt from `all`,
+   so the --stickr-* variables defined on :host still reach the subtree). Kept in normal
+   flow and unpositioned so the absolutely positioned bubble pins keep resolving against
+   the document, exactly as they did as children of body. */
+.dc-ui-layer {
+  all: initial;
+  display: block;
+  position: static;
+  font-family: var(--stickr-font-family);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--stickr-foreground);
 }
 
 /* Password toggle button styles */

@@ -24,6 +24,17 @@ chrome.runtime.onInstalled.addListener((details) => {
 // Listen for messages from content script
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   try {
+    // The content script can no longer render the configuration dialogs itself: they
+    // carried API keys, a Jira token and database credentials in inputs that shared the
+    // host page's DOM. It asks the service worker to open the settings page instead,
+    // since chrome.runtime.openOptionsPage is not available from a content script.
+    if (request.action === 'openOptions') {
+      chrome.runtime.openOptionsPage(() => {
+        sendResponse({ success: !chrome.runtime.lastError });
+      });
+      return true;
+    }
+
     if (request.action === 'getComments') {
       chrome.storage.sync.get('comments', (result) => {
         sendResponse({ comments: result.comments || [] });
