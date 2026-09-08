@@ -19,10 +19,10 @@
       {
         "matches": ["<all_urls>"],
         "js": ["html2canvas.min.js", "database.js", "integrations.js", "content.js"],
-        "css": ["styles.css"],
         "run_at": "document_idle"
       }
     ],
+    "options_page": "options.html",
     "action": {
       "default_popup": "popup.html",
       "default_icon": {
@@ -39,7 +39,7 @@
     "web_accessible_resources": [
       {
         "resources": [
-          "sidebar.html", 
+          "styles.css",
           "/icons/cognito-16.png", 
           "icons/atlassian.png",
           "icons/openai-16.png",

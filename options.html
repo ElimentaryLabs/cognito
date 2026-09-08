@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cognito AI - Settings</title>
+  <!-- Reuses the extension's stylesheet, which supplies .dc-config-menu-item,
+       .dc-dialog-overlay, .dc-form-input, .db-* and .dc-toast used by the relocated
+       configuration dialogs. -->
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    body {
+      margin: 0;
+      padding: 2rem 1.25rem 3rem;
+      background: #F5F5F5;
+      color: #262626;
+    }
+
+    .opt-shell {
+      max-width: 640px;
+      margin: 0 auto;
+    }
+
+    .opt-header h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 700;
+    }
+
+    .opt-header p {
+      margin: 0.5rem 0 0;
+      font-size: 14px;
+      color: #6B7280;
+      line-height: 1.5;
+    }
+
+    .opt-note {
+      margin: 1.25rem 0 1.5rem;
+      padding: 0.75rem 0.9rem;
+      background: #F0F9FF;
+      border: 1px solid #BAE6FD;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.5;
+      color: #0369A1;
+    }
+
+    #opt-cards {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="opt-shell">
+    <div class="opt-header">
+      <h1>⚙️ Cognito AI Settings</h1>
+      <p>Your profile and the credentials for Cognito's integrations are stored and edited here.</p>
+    </div>
+
+    <p class="opt-note">
+      These settings live on the extension's own page rather than in the sidebar, so API keys,
+      access tokens and your email address are never placed in the DOM of a site you are visiting.
+    </p>
+
+    <div id="opt-cards"></div>
+  </div>
+
+  <script src="database.js"></script>
+  <script src="integrations.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>
